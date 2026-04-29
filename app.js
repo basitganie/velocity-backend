@@ -16,7 +16,7 @@ app.use((req, res, next) => {
 });
 
 // ── CONFIG — edit these paths ─────────────────────────────────────────────
-const VELOCITY_BIN    = './velocity';
+const VELOCITY_BIN = path.join(__dirname, 'velocity');
 const VELOCITY_STDLIB = './stdlib';
 const COMPILE_TIMEOUT = 12000;   // ms
 const RUN_TIMEOUT     = 8000;    // ms
