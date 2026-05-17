@@ -53,10 +53,23 @@ static void print_source_line(int line, int column) {
     fprintf(stderr, "^\n");
 }
 
-void error_at(int line, int column, const char *fmt, ...) {
+static const char* error_class_name(ErrorClass cls) {
+    switch (cls) {
+        case ERR_SYNTAX: return "SyntaxError";
+        case ERR_TYPE: return "TypeError";
+        case ERR_IMPORT: return "ImportError";
+        case ERR_LINK: return "LinkError";
+        case ERR_CODEGEN: return "CodegenError";
+        case ERR_SYSTEM: return "SystemError";
+        case ERR_FATAL: return "FatalError";
+        default: return "Error";
+    }
+}
+
+void error_at(ErrorClass cls, int line, int column, const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
-    fprintf(stderr, "\n\033[1;31merror\033[0m");
+    fprintf(stderr, "\n\033[1;31m%s\033[0m", error_class_name(cls));
     if (g_err_ctx.filename)
         fprintf(stderr, " [%s:%d:%d]", g_err_ctx.filename, line, column);
     fprintf(stderr, ": ");
@@ -67,10 +80,10 @@ void error_at(int line, int column, const char *fmt, ...) {
     exit(1);
 }
 
-void error(const char *fmt, ...) {
+void error(ErrorClass cls, const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
-    fprintf(stderr, "\n\033[1;31merror\033[0m");
+    fprintf(stderr, "\n\033[1;31m%s\033[0m", error_class_name(cls));
     if (g_err_ctx.filename)
         fprintf(stderr, " [%s]", g_err_ctx.filename);
     fprintf(stderr, ": ");
@@ -97,12 +110,12 @@ void warn_at(int line, int column, const char *fmt, ...) {
 
 char* read_file(const char *filename) {
     FILE *f = fopen(filename, "rb");
-    if (!f) error("Cannot open file: %s", filename);
+    if (!f) error(ERR_SYSTEM, "Cannot open file: %s", filename);
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
     fseek(f, 0, SEEK_SET);
     char *buf = (char*)malloc(size + 2);
-    if (!buf) error("Out of memory");
+    if (!buf) error(ERR_FATAL, "Out of memory");
     size_t rd = fread(buf, 1, size, f);
     buf[rd] = '\n';
     buf[rd + 1] = '\0';
@@ -140,7 +153,7 @@ char* path_join(const char *dir, const char *file) {
     size_t dlen = strlen(dir);
     size_t flen = strlen(file);
     char *result = (char*)malloc(dlen + flen + 3);
-    if (!result) error("Out of memory");
+    if (!result) error(ERR_FATAL, "Out of memory");
     strcpy(result, dir);
     if (dlen > 0 && dir[dlen-1] != '/' && dir[dlen-1] != '\\') {
         result[dlen] = PATH_SEP;
@@ -299,7 +312,7 @@ static Token read_string(Lexer *lx) {
         lexer_advance(lx);
     }
     if (lx->current_char != '"')
-        error_at(tok.line, tok.column, "unterminated string literal");
+        error_at(ERR_SYNTAX, tok.line, tok.column, "unterminated string literal");
     lexer_advance(lx);
     tok.value[i] = '\0';
     return tok;
@@ -339,6 +352,9 @@ static Token read_identifier(Lexer *lx) {
         {"pakh",      TOK_CONTINUE},
         {"anaw",      TOK_ANAW},
         {"bina",      TOK_BINA},
+        {"amal",      TOK_AMAL},
+        {"union",     TOK_UNION},
+        {"tadad",     TOK_TADAD},
         /* try/catch/panic/throw */
         {"koshish",   TOK_TRY},
         {"try",       TOK_TRY},
@@ -348,11 +364,14 @@ static Token read_identifier(Lexer *lx) {
         {"trayith",    TOK_THROW},
         {"throw",     TOK_THROW},
         {"append",    TOK_APPEND},
+        {"saabit",    TOK_SAABIT},  /* saabit = compile-time constant */
+        {"as",        TOK_AS},      /* as = type cast operator */
         /* types */
         {"adad",      TOK_ADAD},
         {"Adad",      TOK_ADAD},
         {"uadad",     TOK_UADAD},
         {"uadad8",    TOK_UADAD8},
+        {"harf",      TOK_HARF},
         {"ashari",    TOK_ASHARI},
         {"Ashari",    TOK_ASHARI},
         {"ashari32",  TOK_ASHARI32},
@@ -398,6 +417,40 @@ static Token lexer_next_token(Lexer *lx) {
     }
 
     if (lx->current_char == '"') return read_string(lx);
+    if (lx->current_char == '\'') {
+        lexer_advance(lx); /* ' */
+        int start = lx->pos;
+        if (lx->current_char == '\\') {
+            lexer_advance(lx);
+            lexer_advance(lx);
+        } else if (lx->current_char != '\'') {
+            lexer_advance(lx);
+        }
+        int len = lx->pos - start;
+        if (len > MAX_TOKEN_LEN - 1) len = MAX_TOKEN_LEN - 1;
+        vl_strncpy(tok.value, lx->source + start, len + 1);
+        if (lx->current_char != '\'') {
+            error_at(ERR_SYNTAX, lx->line, lx->column, "unterminated character literal");
+        }
+        lexer_advance(lx); /* ' */
+        tok.type = TOK_INTEGER; /* we can treat as int for now, or add TOK_CHAR */
+        
+        /* Convert to integer value */
+        long long val = 0;
+        if (tok.value[0] == '\\') {
+            if (tok.value[1] == 'n') val = '\n';
+            else if (tok.value[1] == 't') val = '\t';
+            else if (tok.value[1] == 'r') val = '\r';
+            else if (tok.value[1] == '0') val = '\0';
+            else if (tok.value[1] == '\'') val = '\'';
+            else if (tok.value[1] == '\\') val = '\\';
+            else val = tok.value[1];
+        } else {
+            val = (unsigned char)tok.value[0];
+        }
+        snprintf(tok.value, sizeof(tok.value), "%lld", val);
+        return tok;
+    }
     if (isdigit((unsigned char)lx->current_char)) return read_number(lx);
     if (isalpha((unsigned char)lx->current_char) ||
         lx->current_char == '_') {
@@ -546,10 +599,22 @@ static Token lexer_next_token(Lexer *lx) {
         case '[': tok.type = TOK_LBRACKET;  break;
         case ']': tok.type = TOK_RBRACKET;  break;
         case ';': tok.type = TOK_SEMICOLON; break;
-        case ':': tok.type = TOK_COLON;     break;
+        case ':':
+            if (lx->source[lx->pos + 1] == ':') {
+                lexer_advance(lx);
+                tok.type = TOK_DCOLON; strcpy(tok.value, "::");
+                lexer_advance(lx); return tok;
+            }
+            tok.type = TOK_COLON; break;
         case ',': tok.type = TOK_COMMA;     break;
         case '.': tok.type = TOK_DOT;       break;
-        case '?': tok.type = TOK_QUESTION;  break;
+        case '?':
+            if (lx->source[lx->pos + 1] == '?') {
+                lexer_advance(lx);
+                tok.type = TOK_DQUESTION; strcpy(tok.value, "??");
+                lexer_advance(lx); return tok;
+            }
+            tok.type = TOK_QUESTION; break;
         case '@': tok.type = TOK_AT;        break;
         default:
             tok.type = TOK_ERROR;
@@ -566,7 +631,7 @@ int lexer_tokenize(Lexer *lx, Token *tokens, int max) {
     while (count < max) {
         Token tok = lexer_next_token(lx);
         if (tok.type == TOK_ERROR)
-            error_at(tok.line, tok.column, "%s", tok.value);
+            error_at(ERR_SYNTAX, tok.line, tok.column, "%s", tok.value);
         tokens[count++] = tok;
         if (tok.type == TOK_EOF) break;
     }
@@ -591,14 +656,20 @@ const char* token_type_name(VelTokenType t) {
         case TOK_CONTINUE:     return "continue";
         case TOK_ANAW:         return "anaw";
         case TOK_BINA:         return "bina";
+        case TOK_AMAL:         return "amal";
+        case TOK_UNION:        return "union";
+        case TOK_TADAD:        return "tadad";
         case TOK_TRY:          return "koshish";
         case TOK_CATCH:        return "ratt";
         case TOK_PANIC:        return "panic";
         case TOK_THROW:        return "trayith";
         case TOK_APPEND:       return "append";
+        case TOK_SAABIT:       return "saabit";
+        case TOK_AS:           return "as";
         case TOK_ADAD:         return "adad";
         case TOK_UADAD:        return "uadad";
         case TOK_UADAD8:       return "uadad8";
+        case TOK_HARF:         return "harf";
         case TOK_ASHARI:       return "ashari";
         case TOK_ASHARI32:     return "ashari32";
         case TOK_BOOL:         return "bool";
@@ -652,12 +723,14 @@ const char* token_type_name(VelTokenType t) {
         case TOK_RBRACKET:     return "]";
         case TOK_SEMICOLON:    return ";";
         case TOK_COLON:        return ":";
+        case TOK_DCOLON:       return "::";
         case TOK_COMMA:        return ",";
         case TOK_ARROW:        return "->";
         case TOK_DOT:          return ".";
         case TOK_DOTDOT:       return "..";
         case TOK_DOTDOTEQ:     return "..=";
         case TOK_QUESTION:     return "?";
+        case TOK_DQUESTION:    return "??";
         case TOK_AT:           return "@";
         case TOK_UNDERSCORE:   return "_";
         case TOK_EOF:          return "EOF";

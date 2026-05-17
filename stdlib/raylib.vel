@@ -1,76 +1,1184 @@
 anaw raylib;
-# =========================================
-# raylib.vel — Velocity stdlib wrapper
-# =========================================
 
-# ---- Window ----
+# ============================================================
+# Velocity RayLib Module v3 — Full 2D + 3D API
+# Kashmiri Edition — links with -lraylib
+# ============================================================
 
-kar init_window(w: adad, h: adad, title: lafz) -> adad {
+# ================================================================
+# CONSTANTS
+# ================================================================
+
+# Window config flags
+saabit FLAG_VSYNC_HINT              = 64;
+saabit FLAG_FULLSCREEN_MODE         = 2;
+saabit FLAG_WINDOW_RESIZABLE        = 4;
+saabit FLAG_WINDOW_UNDECORATED      = 8;
+saabit FLAG_WINDOW_TRANSPARENT      = 16;
+saabit FLAG_MSAA_4X_HINT            = 32;
+saabit FLAG_WINDOW_HIDDEN           = 128;
+saabit FLAG_WINDOW_MINIMIZED        = 512;
+saabit FLAG_WINDOW_MAXIMIZED        = 1024;
+saabit FLAG_WINDOW_UNFOCUSED        = 2048;
+saabit FLAG_WINDOW_TOPMOST          = 4096;
+saabit FLAG_WINDOW_ALWAYS_RUN       = 256;
+saabit FLAG_WINDOW_MOUSE_PASSTHROUGH = 16384;
+
+# Trace log level
+saabit LOG_ALL     = 0;
+saabit LOG_TRACE   = 1;
+saabit LOG_DEBUG   = 2;
+saabit LOG_INFO    = 3;
+saabit LOG_WARNING = 4;
+saabit LOG_ERROR   = 5;
+saabit LOG_FATAL   = 6;
+saabit LOG_NONE    = 7;
+
+# Keyboard keys
+saabit KEY_NULL          = 0;
+saabit KEY_APOSTROPHE    = 39;
+saabit KEY_COMMA         = 44;
+saabit KEY_MINUS         = 45;
+saabit KEY_PERIOD        = 46;
+saabit KEY_SLASH         = 47;
+saabit KEY_ZERO          = 48;
+saabit KEY_ONE           = 49;
+saabit KEY_TWO           = 50;
+saabit KEY_THREE         = 51;
+saabit KEY_FOUR          = 52;
+saabit KEY_FIVE          = 53;
+saabit KEY_SIX           = 54;
+saabit KEY_SEVEN         = 55;
+saabit KEY_EIGHT         = 56;
+saabit KEY_NINE          = 57;
+saabit KEY_SEMICOLON     = 59;
+saabit KEY_EQUAL         = 61;
+saabit KEY_A             = 65;
+saabit KEY_B             = 66;
+saabit KEY_C             = 67;
+saabit KEY_D             = 68;
+saabit KEY_E             = 69;
+saabit KEY_F             = 70;
+saabit KEY_G             = 71;
+saabit KEY_H             = 72;
+saabit KEY_I             = 73;
+saabit KEY_J             = 74;
+saabit KEY_K             = 75;
+saabit KEY_L             = 76;
+saabit KEY_M             = 77;
+saabit KEY_N             = 78;
+saabit KEY_O             = 79;
+saabit KEY_P             = 80;
+saabit KEY_Q             = 81;
+saabit KEY_R             = 82;
+saabit KEY_S             = 83;
+saabit KEY_T             = 84;
+saabit KEY_U             = 85;
+saabit KEY_V             = 86;
+saabit KEY_W             = 87;
+saabit KEY_X             = 88;
+saabit KEY_Y             = 89;
+saabit KEY_Z             = 90;
+saabit KEY_LEFT_BRACKET  = 91;
+saabit KEY_BACKSLASH     = 92;
+saabit KEY_RIGHT_BRACKET = 93;
+saabit KEY_GRAVE         = 96;
+saabit KEY_SPACE         = 32;
+saabit KEY_ESCAPE        = 256;
+saabit KEY_ENTER         = 257;
+saabit KEY_TAB           = 258;
+saabit KEY_BACKSPACE     = 259;
+saabit KEY_INSERT        = 260;
+saabit KEY_DELETE        = 261;
+saabit KEY_RIGHT         = 262;
+saabit KEY_LEFT          = 263;
+saabit KEY_DOWN          = 264;
+saabit KEY_UP            = 265;
+saabit KEY_PAGE_UP       = 266;
+saabit KEY_PAGE_DOWN     = 267;
+saabit KEY_HOME          = 268;
+saabit KEY_END           = 269;
+saabit KEY_CAPS_LOCK     = 280;
+saabit KEY_SCROLL_LOCK   = 281;
+saabit KEY_NUM_LOCK      = 282;
+saabit KEY_PRINT_SCREEN  = 283;
+saabit KEY_PAUSE         = 284;
+saabit KEY_F1            = 290;
+saabit KEY_F2            = 291;
+saabit KEY_F3            = 292;
+saabit KEY_F4            = 293;
+saabit KEY_F5            = 294;
+saabit KEY_F6            = 295;
+saabit KEY_F7            = 296;
+saabit KEY_F8            = 297;
+saabit KEY_F9            = 298;
+saabit KEY_F10           = 299;
+saabit KEY_F11           = 300;
+saabit KEY_F12           = 301;
+saabit KEY_LEFT_SHIFT    = 340;
+saabit KEY_LEFT_CONTROL  = 341;
+saabit KEY_LEFT_ALT      = 342;
+saabit KEY_LEFT_SUPER    = 343;
+saabit KEY_RIGHT_SHIFT   = 344;
+saabit KEY_RIGHT_CONTROL = 345;
+saabit KEY_RIGHT_ALT     = 346;
+saabit KEY_RIGHT_SUPER   = 347;
+saabit KEY_KB_MENU       = 348;
+saabit KEY_KP_0          = 320;
+saabit KEY_KP_1          = 321;
+saabit KEY_KP_2          = 322;
+saabit KEY_KP_3          = 323;
+saabit KEY_KP_4          = 324;
+saabit KEY_KP_5          = 325;
+saabit KEY_KP_6          = 326;
+saabit KEY_KP_7          = 327;
+saabit KEY_KP_8          = 328;
+saabit KEY_KP_9          = 329;
+saabit KEY_KP_DECIMAL    = 330;
+saabit KEY_KP_DIVIDE     = 331;
+saabit KEY_KP_MULTIPLY   = 332;
+saabit KEY_KP_SUBTRACT   = 333;
+saabit KEY_KP_ADD        = 334;
+saabit KEY_KP_ENTER      = 335;
+saabit KEY_KP_EQUAL      = 336;
+
+# Mouse buttons
+saabit MOUSE_BUTTON_LEFT   = 0;
+saabit MOUSE_BUTTON_RIGHT  = 1;
+saabit MOUSE_BUTTON_MIDDLE = 2;
+saabit MOUSE_BUTTON_SIDE   = 3;
+saabit MOUSE_BUTTON_EXTRA  = 4;
+saabit MOUSE_BUTTON_FORWARD = 5;
+saabit MOUSE_BUTTON_BACK   = 6;
+# Aliases
+saabit MOUSE_LEFT          = 0;
+saabit MOUSE_RIGHT         = 1;
+saabit MOUSE_MIDDLE        = 2;
+
+# Mouse cursor
+saabit MOUSE_CURSOR_DEFAULT       = 0;
+saabit MOUSE_CURSOR_ARROW         = 1;
+saabit MOUSE_CURSOR_IBEAM         = 2;
+saabit MOUSE_CURSOR_CROSSHAIR     = 3;
+saabit MOUSE_CURSOR_POINTING_HAND = 4;
+saabit MOUSE_CURSOR_RESIZE_EW     = 5;
+saabit MOUSE_CURSOR_RESIZE_NS     = 6;
+saabit MOUSE_CURSOR_RESIZE_NWSE   = 7;
+saabit MOUSE_CURSOR_RESIZE_NESW   = 8;
+saabit MOUSE_CURSOR_RESIZE_ALL    = 9;
+saabit MOUSE_CURSOR_NOT_ALLOWED   = 10;
+
+# Gamepad buttons
+saabit GAMEPAD_BUTTON_UNKNOWN              = 0;
+saabit GAMEPAD_BUTTON_LEFT_FACE_UP         = 1;
+saabit GAMEPAD_BUTTON_LEFT_FACE_RIGHT      = 2;
+saabit GAMEPAD_BUTTON_LEFT_FACE_DOWN       = 3;
+saabit GAMEPAD_BUTTON_LEFT_FACE_LEFT       = 4;
+saabit GAMEPAD_BUTTON_RIGHT_FACE_UP        = 5;
+saabit GAMEPAD_BUTTON_RIGHT_FACE_RIGHT     = 6;
+saabit GAMEPAD_BUTTON_RIGHT_FACE_DOWN      = 7;
+saabit GAMEPAD_BUTTON_RIGHT_FACE_LEFT      = 8;
+saabit GAMEPAD_BUTTON_LEFT_TRIGGER_1       = 9;
+saabit GAMEPAD_BUTTON_LEFT_TRIGGER_2       = 10;
+saabit GAMEPAD_BUTTON_RIGHT_TRIGGER_1      = 11;
+saabit GAMEPAD_BUTTON_RIGHT_TRIGGER_2      = 12;
+saabit GAMEPAD_BUTTON_MIDDLE_LEFT          = 13;
+saabit GAMEPAD_BUTTON_MIDDLE              = 14;
+saabit GAMEPAD_BUTTON_MIDDLE_RIGHT        = 15;
+saabit GAMEPAD_BUTTON_LEFT_THUMB          = 16;
+saabit GAMEPAD_BUTTON_RIGHT_THUMB         = 17;
+
+# Gamepad axes
+saabit GAMEPAD_AXIS_LEFT_X        = 0;
+saabit GAMEPAD_AXIS_LEFT_Y        = 1;
+saabit GAMEPAD_AXIS_RIGHT_X       = 2;
+saabit GAMEPAD_AXIS_RIGHT_Y       = 3;
+saabit GAMEPAD_AXIS_LEFT_TRIGGER  = 4;
+saabit GAMEPAD_AXIS_RIGHT_TRIGGER = 5;
+
+# Texture filter
+saabit TEXTURE_FILTER_POINT            = 0;
+saabit TEXTURE_FILTER_BILINEAR         = 1;
+saabit TEXTURE_FILTER_TRILINEAR        = 2;
+saabit TEXTURE_FILTER_ANISOTROPIC_4X   = 3;
+saabit TEXTURE_FILTER_ANISOTROPIC_8X   = 4;
+saabit TEXTURE_FILTER_ANISOTROPIC_16X  = 5;
+
+# Texture wrap
+saabit TEXTURE_WRAP_REPEAT         = 0;
+saabit TEXTURE_WRAP_CLAMP          = 1;
+saabit TEXTURE_WRAP_MIRROR_REPEAT  = 2;
+saabit TEXTURE_WRAP_MIRROR_CLAMP   = 3;
+
+# Blend modes
+saabit BLEND_ALPHA           = 0;
+saabit BLEND_ADDITIVE        = 1;
+saabit BLEND_MULTIPLIED      = 2;
+saabit BLEND_ADD_COLORS      = 3;
+saabit BLEND_SUBTRACT_COLORS = 4;
+saabit BLEND_ALPHA_PREMULTIPLY = 5;
+saabit BLEND_CUSTOM          = 6;
+saabit BLEND_CUSTOM_SEPARATE = 7;
+
+# Camera modes
+saabit CAMERA_CUSTOM      = 0;
+saabit CAMERA_FREE        = 1;
+saabit CAMERA_ORBITAL     = 2;
+saabit CAMERA_FIRST_PERSON = 3;
+saabit CAMERA_THIRD_PERSON = 4;
+
+# Camera projection
+saabit CAMERA_PERSPECTIVE  = 0;
+saabit CAMERA_ORTHOGRAPHIC = 1;
+
+# Shader location index
+saabit SHADER_LOC_VERTEX_POSITION   = 0;
+saabit SHADER_LOC_VERTEX_TEXCOORD01 = 1;
+saabit SHADER_LOC_VERTEX_TEXCOORD02 = 2;
+saabit SHADER_LOC_VERTEX_NORMAL     = 3;
+saabit SHADER_LOC_VERTEX_TANGENT    = 4;
+saabit SHADER_LOC_VERTEX_COLOR      = 5;
+saabit SHADER_LOC_MATRIX_MVP        = 6;
+saabit SHADER_LOC_MATRIX_VIEW       = 7;
+saabit SHADER_LOC_MATRIX_PROJECTION = 8;
+saabit SHADER_LOC_MATRIX_MODEL      = 9;
+saabit SHADER_LOC_MATRIX_NORMAL     = 10;
+saabit SHADER_LOC_VECTOR_VIEW       = 11;
+saabit SHADER_LOC_COLOR_DIFFUSE     = 12;
+saabit SHADER_LOC_COLOR_SPECULAR    = 13;
+saabit SHADER_LOC_COLOR_AMBIENT     = 14;
+saabit SHADER_LOC_MAP_ALBEDO        = 15;
+saabit SHADER_LOC_MAP_METALNESS     = 16;
+saabit SHADER_LOC_MAP_NORMAL        = 17;
+saabit SHADER_LOC_MAP_ROUGHNESS     = 18;
+saabit SHADER_LOC_MAP_OCCLUSION     = 19;
+saabit SHADER_LOC_MAP_EMISSION      = 20;
+saabit SHADER_LOC_MAP_HEIGHT        = 21;
+saabit SHADER_LOC_MAP_CUBEMAP       = 22;
+saabit SHADER_LOC_MAP_IRRADIANCE    = 23;
+saabit SHADER_LOC_MAP_PREFILTER     = 24;
+saabit SHADER_LOC_MAP_BRDF          = 25;
+
+# Shader uniform type
+saabit SHADER_UNIFORM_FLOAT     = 0;
+saabit SHADER_UNIFORM_VEC2      = 1;
+saabit SHADER_UNIFORM_VEC3      = 2;
+saabit SHADER_UNIFORM_VEC4      = 3;
+saabit SHADER_UNIFORM_INT       = 4;
+saabit SHADER_UNIFORM_IVEC2     = 5;
+saabit SHADER_UNIFORM_IVEC3     = 6;
+saabit SHADER_UNIFORM_IVEC4     = 7;
+saabit SHADER_UNIFORM_SAMPLER2D = 8;
+
+# Material map index
+saabit MATERIAL_MAP_ALBEDO      = 0;
+saabit MATERIAL_MAP_METALNESS   = 1;
+saabit MATERIAL_MAP_NORMAL      = 2;
+saabit MATERIAL_MAP_ROUGHNESS   = 3;
+saabit MATERIAL_MAP_OCCLUSION   = 4;
+saabit MATERIAL_MAP_EMISSION    = 5;
+saabit MATERIAL_MAP_HEIGHT      = 6;
+saabit MATERIAL_MAP_CUBEMAP     = 7;
+saabit MATERIAL_MAP_IRRADIANCE  = 8;
+saabit MATERIAL_MAP_PREFILTER   = 9;
+saabit MATERIAL_MAP_BRDF        = 10;
+
+# Gesture flags
+saabit GESTURE_NONE        = 0;
+saabit GESTURE_TAP         = 1;
+saabit GESTURE_DOUBLETAP   = 2;
+saabit GESTURE_HOLD        = 4;
+saabit GESTURE_DRAG        = 8;
+saabit GESTURE_SWIPE_RIGHT = 16;
+saabit GESTURE_SWIPE_LEFT  = 32;
+saabit GESTURE_SWIPE_UP    = 64;
+saabit GESTURE_SWIPE_DOWN  = 128;
+saabit GESTURE_PINCH_IN    = 256;
+saabit GESTURE_PINCH_OUT   = 512;
+
+# ================================================================
+# WINDOW
+# ================================================================
+kar init_window(w: adad, h: adad, title: lafz) -> khali {
     rl_init_window(w, h, title);
-    chu 0;
 }
-
+kar close_window() -> khali {
+    rl_close_window();
+}
 kar window_should_close() -> adad {
     chu rl_window_should_close();
 }
-
-kar close_window() -> adad {
-    rl_close_window();
-    chu 0;
+kar is_window_ready() -> adad {
+    chu rl_is_window_ready();
+}
+kar is_window_fullscreen() -> adad {
+    chu rl_is_window_fullscreen();
+}
+kar is_window_hidden() -> adad {
+    chu rl_is_window_hidden();
+}
+kar is_window_minimized() -> adad {
+    chu rl_is_window_minimized();
+}
+kar is_window_maximized() -> adad {
+    chu rl_is_window_maximized();
+}
+kar is_window_focused() -> adad {
+    chu rl_is_window_focused();
+}
+kar is_window_resized() -> adad {
+    chu rl_is_window_resized();
+}
+kar set_window_state(flags: adad) -> khali {
+    rl_set_window_state(flags);
+}
+kar clear_window_state(flags: adad) -> khali {
+    rl_clear_window_state(flags);
+}
+kar toggle_fullscreen() -> khali {
+    rl_toggle_fullscreen();
+}
+kar toggle_borderless_windowed() -> khali {
+    rl_toggle_borderless_windowed();
+}
+kar maximize_window() -> khali {
+    rl_maximize_window();
+}
+kar minimize_window() -> khali {
+    rl_minimize_window();
+}
+kar restore_window() -> khali {
+    rl_restore_window();
+}
+kar set_window_title(title: lafz) -> khali {
+    rl_set_window_title(title);
+}
+kar set_window_position(x: adad, y: adad) -> khali {
+    rl_set_window_position(x, y);
+}
+kar set_window_monitor(monitor: adad) -> khali {
+    rl_set_window_monitor(monitor);
+}
+kar set_window_min_size(w: adad, h: adad) -> khali {
+    rl_set_window_min_size(w, h);
+}
+kar set_window_max_size(w: adad, h: adad) -> khali {
+    rl_set_window_max_size(w, h);
+}
+kar set_window_size(w: adad, h: adad) -> khali {
+    rl_set_window_size(w, h);
+}
+kar set_window_opacity(opacity: ashari) -> khali {
+    rl_set_window_opacity(opacity);
+}
+kar set_window_focused() -> khali {
+    rl_set_window_focused();
+}
+kar get_screen_width() -> adad {
+    chu rl_get_screen_width();
+}
+kar get_screen_height() -> adad {
+    chu rl_get_screen_height();
+}
+kar get_render_width() -> adad {
+    chu rl_get_render_width();
+}
+kar get_render_height() -> adad {
+    chu rl_get_render_height();
+}
+kar get_monitor_count() -> adad {
+    chu rl_get_monitor_count();
+}
+kar get_current_monitor() -> adad {
+    chu rl_get_current_monitor();
+}
+kar get_monitor_width(monitor: adad) -> adad {
+    chu rl_get_monitor_width(monitor);
+}
+kar get_monitor_height(monitor: adad) -> adad {
+    chu rl_get_monitor_height(monitor);
+}
+kar get_monitor_refresh_rate(monitor: adad) -> adad {
+    chu rl_get_monitor_refresh_rate(monitor);
+}
+kar get_monitor_name(monitor: adad) -> lafz {
+    chu rl_get_monitor_name(monitor);
+}
+kar set_clipboard_text(text: lafz) -> khali {
+    rl_set_clipboard_text(text);
+}
+kar get_clipboard_text() -> lafz {
+    chu rl_get_clipboard_text();
+}
+kar enable_event_waiting() -> khali {
+    rl_enable_event_waiting();
+}
+kar disable_event_waiting() -> khali {
+    rl_disable_event_waiting();
 }
 
-kar set_target_fps(fps: adad) -> adad {
+# ================================================================
+# TIMING
+# ================================================================
+kar set_target_fps(fps: adad) -> khali {
     rl_set_target_fps(fps);
-    chu 0;
+}
+kar get_fps() -> adad {
+    chu rl_get_fps();
+}
+kar get_frame_time() -> ashari {
+    chu rl_get_frame_time();
+}
+kar get_time() -> ashari {
+    chu rl_get_time();
+}
+kar wait_time(seconds: ashari) -> khali {
+    rl_wait_time(seconds);
 }
 
-# ---- Drawing ----
-
-kar begin_drawing() -> adad {
-    rl_begin_drawing();
-    chu 0;
+# ================================================================
+# CONFIG
+# ================================================================
+kar set_config_flags(flags: adad) -> khali {
+    rl_set_config_flags(flags);
+}
+kar set_trace_log_level(level: adad) -> khali {
+    rl_set_trace_log_level(level);
+}
+kar set_exit_key(key: adad) -> khali {
+    rl_set_exit_key(key);
 }
 
-kar end_drawing() -> adad {
-    rl_end_drawing();
-    chu 0;
-}
-
-kar clear_background(color: adad) -> adad {
+# ================================================================
+# DRAWING PIPELINE
+# ================================================================
+kar clear_background(color: adad) -> khali {
     rl_clear_background(color);
-    chu 0;
+}
+kar begin_drawing() -> khali {
+    rl_begin_drawing();
+}
+kar end_drawing() -> khali {
+    rl_end_drawing();
+}
+kar begin_mode2d(cam: adad) -> khali {
+    rl_begin_mode2d(cam);
+}
+kar end_mode2d() -> khali {
+    rl_end_mode2d();
+}
+kar begin_mode3d(cam: adad) -> khali {
+    rl_begin_mode3d(cam);
+}
+kar end_mode3d() -> khali {
+    rl_end_mode3d();
+}
+kar begin_texture_mode(target: adad) -> khali {
+    rl_begin_texture_mode(target);
+}
+kar end_texture_mode() -> khali {
+    rl_end_texture_mode();
+}
+kar begin_shader_mode(shader: adad) -> khali {
+    rl_begin_shader_mode(shader);
+}
+kar end_shader_mode() -> khali {
+    rl_end_shader_mode();
+}
+kar begin_blend_mode(mode: adad) -> khali {
+    rl_begin_blend_mode(mode);
+}
+kar end_blend_mode() -> khali {
+    rl_end_blend_mode();
+}
+kar begin_scissor_mode(x: adad, y: adad, w: adad, h: adad) -> khali {
+    rl_begin_scissor_mode(x, y, w, h);
+}
+kar end_scissor_mode() -> khali {
+    rl_end_scissor_mode();
 }
 
-# ---- Shapes / Text ----
-
-kar draw_text(text: lafz, x: adad, y: adad, size: adad, color: adad) -> adad {
-    rl_draw_text(text, x, y, size, color);
-    chu 0;
+# ================================================================
+# 2D SHAPES
+# ================================================================
+kar draw_pixel(x: adad, y: adad, color: adad) -> khali {
+    rl_draw_pixel(x, y, color);
 }
-
-kar draw_rectangle(x: adad, y: adad, w: adad, h: adad, color: adad) -> adad {
+kar draw_line(x1: adad, y1: adad, x2: adad, y2: adad, color: adad) -> khali {
+    rl_draw_line(x1, y1, x2, y2, color);
+}
+kar draw_line_ex(x1: ashari, y1: ashari, x2: ashari, y2: ashari, thick: ashari, color: adad) -> khali {
+    rl_draw_line_ex(x1, y1, x2, y2, thick, color);
+}
+kar draw_line_bezier(x1: ashari, y1: ashari, x2: ashari, y2: ashari, thick: ashari, color: adad) -> khali {
+    rl_draw_line_bezier(x1, y1, x2, y2, thick, color);
+}
+kar draw_circle(x: adad, y: adad, radius: ashari, color: adad) -> khali {
+    rl_draw_circle(x, y, radius, color);
+}
+kar draw_circle_sector(cx: ashari, cy: ashari, radius: ashari, start_angle: ashari, end_angle: ashari, segments: adad, color: adad) -> khali {
+    rl_draw_circle_sector(cx, cy, radius, start_angle, end_angle, segments, color);
+}
+kar draw_circle_sector_lines(cx: ashari, cy: ashari, radius: ashari, start_angle: ashari, end_angle: ashari, segments: adad, color: adad) -> khali {
+    rl_draw_circle_sector_lines(cx, cy, radius, start_angle, end_angle, segments, color);
+}
+kar draw_circle_gradient(x: adad, y: adad, radius: ashari, color1: adad, color2: adad) -> khali {
+    rl_draw_circle_gradient(x, y, radius, color1, color2);
+}
+kar draw_circle_lines(x: adad, y: adad, radius: ashari, color: adad) -> khali {
+    rl_draw_circle_lines(x, y, radius, color);
+}
+kar draw_ellipse(x: adad, y: adad, rx: ashari, ry: ashari, color: adad) -> khali {
+    rl_draw_ellipse(x, y, rx, ry, color);
+}
+kar draw_ellipse_lines(x: adad, y: adad, rx: ashari, ry: ashari, color: adad) -> khali {
+    rl_draw_ellipse_lines(x, y, rx, ry, color);
+}
+kar draw_ring(cx: ashari, cy: ashari, inner_r: ashari, outer_r: ashari, start_angle: ashari, end_angle: ashari, segments: adad, color: adad) -> khali {
+    rl_draw_ring(cx, cy, inner_r, outer_r, start_angle, end_angle, segments, color);
+}
+kar draw_ring_lines(cx: ashari, cy: ashari, inner_r: ashari, outer_r: ashari, start_angle: ashari, end_angle: ashari, segments: adad, color: adad) -> khali {
+    rl_draw_ring_lines(cx, cy, inner_r, outer_r, start_angle, end_angle, segments, color);
+}
+kar draw_rectangle(x: adad, y: adad, w: adad, h: adad, color: adad) -> khali {
     rl_draw_rectangle(x, y, w, h, color);
-    chu 0;
+}
+kar draw_rectangle_gradient_v(x: adad, y: adad, w: adad, h: adad, top: adad, bottom: adad) -> khali {
+    rl_draw_rectangle_gradient_v(x, y, w, h, top, bottom);
+}
+kar draw_rectangle_gradient_h(x: adad, y: adad, w: adad, h: adad, left: adad, right: adad) -> khali {
+    rl_draw_rectangle_gradient_h(x, y, w, h, left, right);
+}
+kar draw_rectangle_lines(x: adad, y: adad, w: adad, h: adad, color: adad) -> khali {
+    rl_draw_rectangle_lines(x, y, w, h, color);
+}
+kar draw_rectangle_rounded(x: ashari, y: ashari, w: ashari, h: ashari, roundness: ashari, segments: adad, color: adad) -> khali {
+    rl_draw_rectangle_rounded(x, y, w, h, roundness, segments, color);
+}
+kar draw_rectangle_rounded_lines(x: ashari, y: ashari, w: ashari, h: ashari, roundness: ashari, segments: adad, color: adad) -> khali {
+    rl_draw_rectangle_rounded_lines(x, y, w, h, roundness, segments, color);
+}
+kar draw_triangle(x1: ashari, y1: ashari, x2: ashari, y2: ashari, x3: ashari, y3: ashari, color: adad) -> khali {
+    rl_draw_triangle(x1, y1, x2, y2, x3, y3, color);
+}
+kar draw_triangle_lines(x1: ashari, y1: ashari, x2: ashari, y2: ashari, x3: ashari, y3: ashari, color: adad) -> khali {
+    rl_draw_triangle_lines(x1, y1, x2, y2, x3, y3, color);
+}
+kar draw_poly(cx: ashari, cy: ashari, sides: adad, radius: ashari, rotation: ashari, color: adad) -> khali {
+    rl_draw_poly(cx, cy, sides, radius, rotation, color);
+}
+kar draw_poly_lines(cx: ashari, cy: ashari, sides: adad, radius: ashari, rotation: ashari, color: adad) -> khali {
+    rl_draw_poly_lines(cx, cy, sides, radius, rotation, color);
 }
 
-# ---- Colors (simple packed RGBA helpers) ----
-kar color_black() -> adad {
-    chu 0xFF000000;
+# ================================================================
+# COLLISION 2D
+# ================================================================
+kar check_collision_recs(x1: adad, y1: adad, w1: adad, h1: adad, x2: adad, y2: adad, w2: adad, h2: adad) -> adad {
+    chu rl_check_collision_recs(x1, y1, w1, h1, x2, y2, w2, h2);
+}
+kar check_collision_circles(cx1: ashari, cy1: ashari, r1: ashari, cx2: ashari, cy2: ashari, r2: ashari) -> adad {
+    chu rl_check_collision_circles(cx1, cy1, r1, cx2, cy2, r2);
+}
+kar check_collision_point_rec(px: ashari, py: ashari, x: adad, y: adad, w: adad, h: adad) -> adad {
+    chu rl_check_collision_point_rec(px, py, x, y, w, h);
+}
+kar check_collision_point_circle(px: ashari, py: ashari, cx: ashari, cy: ashari, r: ashari) -> adad {
+    chu rl_check_collision_point_circle(px, py, cx, cy, r);
 }
 
-kar color_white() -> adad {
-    chu 0xFFFFFFFF;
+# ================================================================
+# TEXT
+# ================================================================
+kar draw_fps(x: adad, y: adad) -> khali {
+    rl_draw_fps(x, y);
+}
+kar draw_text(text: lafz, x: adad, y: adad, size: adad, color: adad) -> khali {
+    rl_draw_text(text, x, y, size, color);
+}
+kar draw_text_ex(font: adad, text: lafz, px: ashari, py: ashari, size: ashari, spacing: ashari, color: adad) -> khali {
+    rl_draw_text_ex(font, text, px, py, size, spacing, color);
+}
+kar measure_text(text: lafz, size: adad) -> adad {
+    chu rl_measure_text(text, size);
+}
+kar load_font(path: lafz) -> adad {
+    chu rl_load_font(path);
+}
+kar load_font_ex(path: lafz, size: adad, codepoints: adad, cp_count: adad) -> adad {
+    chu rl_load_font_ex(path, size, codepoints, cp_count);
+}
+kar unload_font(font: adad) -> khali {
+    rl_unload_font(font);
+}
+kar get_font_default() -> adad {
+    chu rl_get_font_default();
+}
+kar set_text_line_spacing(spacing: adad) -> khali {
+    rl_set_text_line_spacing(spacing);
 }
 
-kar color_red() -> adad {
-    chu 0xFF0000FF;
+# ================================================================
+# TEXTURES
+# ================================================================
+kar load_texture(path: lafz) -> adad {
+    chu rl_load_texture(path);
+}
+kar load_texture_from_image(img: adad) -> adad {
+    chu rl_load_texture_from_image(img);
+}
+kar load_render_texture(w: adad, h: adad) -> adad {
+    chu rl_load_render_texture(w, h);
+}
+kar is_texture_ready(tex: adad) -> adad {
+    chu rl_is_texture_ready(tex);
+}
+kar unload_texture(tex: adad) -> khali {
+    rl_unload_texture(tex);
+}
+kar unload_render_texture(target: adad) -> khali {
+    rl_unload_render_texture(target);
+}
+kar draw_texture(tex: adad, x: adad, y: adad, color: adad) -> khali {
+    rl_draw_texture(tex, x, y, color);
+}
+kar draw_texture_ex(tex: adad, px: ashari, py: ashari, rotation: ashari, scale: ashari, color: adad) -> khali {
+    rl_draw_texture_ex(tex, px, py, rotation, scale, color);
+}
+kar draw_texture_rec(tex: adad, src_x: ashari, src_y: ashari, src_w: ashari, src_h: ashari, px: ashari, py: ashari, color: adad) -> khali {
+    rl_draw_texture_rec(tex, src_x, src_y, src_w, src_h, px, py, color);
+}
+kar draw_texture_pro(tex: adad, src_x: ashari, src_y: ashari, src_w: ashari, src_h: ashari, dst_x: ashari, dst_y: ashari, dst_w: ashari, dst_h: ashari, ox: ashari, oy: ashari, rotation: ashari, color: adad) -> khali {
+    rl_draw_texture_pro(tex, src_x, src_y, src_w, src_h, dst_x, dst_y, dst_w, dst_h, ox, oy, rotation, color);
+}
+kar set_texture_filter(tex: adad, filter: adad) -> khali {
+    rl_set_texture_filter(tex, filter);
+}
+kar set_texture_wrap(tex: adad, wrap: adad) -> khali {
+    rl_set_texture_wrap(tex, wrap);
+}
+kar gen_texture_mipmaps(tex: adad) -> khali {
+    rl_gen_texture_mipmaps(tex);
 }
 
-kar color_green() -> adad {
-    chu 0xFF00FF00;
+# ================================================================
+# IMAGES
+# ================================================================
+kar load_image(path: lafz) -> adad {
+    chu rl_load_image(path);
+}
+kar load_image_raw(path: lafz, w: adad, h: adad, fmt: adad, headerSize: adad) -> adad {
+    chu rl_load_image_raw(path, w, h, fmt, headerSize);
+}
+kar is_image_ready(img: adad) -> adad {
+    chu rl_is_image_ready(img);
+}
+kar unload_image(img: adad) -> khali {
+    rl_unload_image(img);
+}
+kar export_image(img: adad, path: lafz) -> adad {
+    chu rl_export_image(img, path);
+}
+kar gen_image_color(w: adad, h: adad, color: adad) -> adad {
+    chu rl_gen_image_color(w, h, color);
+}
+kar gen_image_gradient_linear(w: adad, h: adad, direction: adad, start: adad, end: adad) -> adad {
+    chu rl_gen_image_gradient_linear(w, h, direction, start, end);
+}
+kar gen_image_gradient_radial(w: adad, h: adad, density: ashari, inner: adad, outer: adad) -> adad {
+    chu rl_gen_image_gradient_radial(w, h, density, inner, outer);
+}
+kar gen_image_checked(w: adad, h: adad, checksX: adad, checksY: adad, col1: adad, col2: adad) -> adad {
+    chu rl_gen_image_checked(w, h, checksX, checksY, col1, col2);
+}
+kar gen_image_white_noise(w: adad, h: adad, factor: ashari) -> adad {
+    chu rl_gen_image_white_noise(w, h, factor);
+}
+kar image_resize(img: adad, new_w: adad, new_h: adad) -> khali {
+    rl_image_resize(img, new_w, new_h);
+}
+kar image_flip_vertical(img: adad) -> khali {
+    rl_image_flip_vertical(img);
+}
+kar image_flip_horizontal(img: adad) -> khali {
+    rl_image_flip_horizontal(img);
+}
+kar image_rotate_cw(img: adad) -> khali {
+    rl_image_rotate_cw(img);
+}
+kar image_rotate_ccw(img: adad) -> khali {
+    rl_image_rotate_ccw(img);
+}
+kar image_color_tint(img: adad, color: adad) -> khali {
+    rl_image_color_tint(img, color);
+}
+kar image_color_invert(img: adad) -> khali {
+    rl_image_color_invert(img);
+}
+kar image_color_grayscale(img: adad) -> khali {
+    rl_image_color_grayscale(img);
 }
 
-kar color_blue() -> adad {
-    chu 0xFFFF0000;
+# ================================================================
+# COLORS
+# ================================================================
+kar color_rgba(r: adad, g: adad, b: adad, a: adad) -> adad {
+    chu rl_color_rgba(r, g, b, a);
+}
+kar fade(color: adad, alpha: ashari) -> adad {
+    chu rl_fade(color, alpha);
+}
+kar color_to_int(color: adad) -> adad {
+    chu rl_color_to_int(color);
+}
+kar color_tint(color: adad, tint: adad) -> adad {
+    chu rl_color_tint(color, tint);
+}
+kar color_brightness(color: adad, factor: ashari) -> adad {
+    chu rl_color_brightness(color, factor);
+}
+kar color_contrast(color: adad, contrast: ashari) -> adad {
+    chu rl_color_contrast(color, contrast);
+}
+kar color_alpha(color: adad, alpha: ashari) -> adad {
+    chu rl_color_alpha(color, alpha);
+}
+kar color_alpha_blend(dst: adad, src: adad, tint: adad) -> adad {
+    chu rl_color_alpha_blend(dst, src, tint);
+}
+kar get_color(hex: adad) -> adad {
+    chu rl_get_color(hex);
 }
 
+# Color presets
+kar color_black()       -> adad { chu rl_color_black(); }
+kar color_white()       -> adad { chu rl_color_white(); }
+kar color_red()         -> adad { chu rl_color_red(); }
+kar color_green()       -> adad { chu rl_color_green(); }
+kar color_blue()        -> adad { chu rl_color_blue(); }
+kar color_yellow()      -> adad { chu rl_color_yellow(); }
+kar color_orange()      -> adad { chu rl_color_orange(); }
+kar color_purple()      -> adad { chu rl_color_purple(); }
+kar color_magenta()     -> adad { chu rl_color_magenta(); }
+kar color_gray()        -> adad { chu rl_color_gray(); }
+kar color_darkgray()    -> adad { chu rl_color_darkgray(); }
+kar color_lightgray()   -> adad { chu rl_color_lightgray(); }
+kar color_skyblue()     -> adad { chu rl_color_skyblue(); }
+kar color_lime()        -> adad { chu rl_color_lime(); }
+kar color_gold()        -> adad { chu rl_color_gold(); }
+kar color_pink()        -> adad { chu rl_color_pink(); }
+kar color_maroon()      -> adad { chu rl_color_maroon(); }
+kar color_beige()       -> adad { chu rl_color_beige(); }
+kar color_brown()       -> adad { chu rl_color_brown(); }
+kar color_darkbrown()   -> adad { chu rl_color_darkbrown(); }
+kar color_darkblue()    -> adad { chu rl_color_darkblue(); }
+kar color_darkgreen()   -> adad { chu rl_color_darkgreen(); }
+kar color_darkpurple()  -> adad { chu rl_color_darkpurple(); }
+kar color_violet()      -> adad { chu rl_color_violet(); }
+kar color_transparent() -> adad { chu rl_color_transparent(); }
+
+# ================================================================
+# 3D DRAWING
+# ================================================================
+kar draw_line3d(sx: ashari, sy: ashari, sz: ashari, ex: ashari, ey: ashari, ez: ashari, color: adad) -> khali {
+    rl_draw_line3d(sx, sy, sz, ex, ey, ez, color);
+}
+kar draw_point3d(x: ashari, y: ashari, z: ashari, color: adad) -> khali {
+    rl_draw_point3d(x, y, z, color);
+}
+kar draw_circle3d(cx: ashari, cy: ashari, cz: ashari, ax: ashari, ay: ashari, az: ashari, angle: ashari, radius: ashari, color: adad) -> khali {
+    rl_draw_circle3d(cx, cy, cz, ax, ay, az, angle, radius, color);
+}
+kar draw_cube(x: ashari, y: ashari, z: ashari, w: ashari, h: ashari, l: ashari, color: adad) -> khali {
+    rl_draw_cube(x, y, z, w, h, l, color);
+}
+kar draw_cube_wires(x: ashari, y: ashari, z: ashari, w: ashari, h: ashari, l: ashari, color: adad) -> khali {
+    rl_draw_cube_wires(x, y, z, w, h, l, color);
+}
+kar draw_sphere(cx: ashari, cy: ashari, cz: ashari, radius: ashari, color: adad) -> khali {
+    rl_draw_sphere(cx, cy, cz, radius, color);
+}
+kar draw_sphere_ex(cx: ashari, cy: ashari, cz: ashari, radius: ashari, rings: adad, slices: adad, color: adad) -> khali {
+    rl_draw_sphere_ex(cx, cy, cz, radius, rings, slices, color);
+}
+kar draw_sphere_wires(cx: ashari, cy: ashari, cz: ashari, radius: ashari, rings: adad, slices: adad, color: adad) -> khali {
+    rl_draw_sphere_wires(cx, cy, cz, radius, rings, slices, color);
+}
+kar draw_cylinder(x: ashari, y: ashari, z: ashari, r_top: ashari, r_bot: ashari, height: ashari, slices: adad, color: adad) -> khali {
+    rl_draw_cylinder(x, y, z, r_top, r_bot, height, slices, color);
+}
+kar draw_cylinder_ex(sx: ashari, sy: ashari, sz: ashari, ex: ashari, ey: ashari, ez: ashari, sr: ashari, er: ashari, slices: adad, color: adad) -> khali {
+    rl_draw_cylinder_ex(sx, sy, sz, ex, ey, ez, sr, er, slices, color);
+}
+kar draw_cylinder_wires(x: ashari, y: ashari, z: ashari, r_top: ashari, r_bot: ashari, height: ashari, slices: adad, color: adad) -> khali {
+    rl_draw_cylinder_wires(x, y, z, r_top, r_bot, height, slices, color);
+}
+kar draw_capsule(sx: ashari, sy: ashari, sz: ashari, ex: ashari, ey: ashari, ez: ashari, radius: ashari, slices: adad, rings: adad, color: adad) -> khali {
+    rl_draw_capsule(sx, sy, sz, ex, ey, ez, radius, slices, rings, color);
+}
+kar draw_capsule_wires(sx: ashari, sy: ashari, sz: ashari, ex: ashari, ey: ashari, ez: ashari, radius: ashari, slices: adad, rings: adad, color: adad) -> khali {
+    rl_draw_capsule_wires(sx, sy, sz, ex, ey, ez, radius, slices, rings, color);
+}
+kar draw_plane(cx: ashari, cy: ashari, cz: ashari, sx: ashari, sz: ashari, color: adad) -> khali {
+    rl_draw_plane(cx, cy, cz, sx, sz, color);
+}
+kar draw_grid(slices: adad, spacing: ashari) -> khali {
+    rl_draw_grid(slices, spacing);
+}
+kar draw_bounding_box(minx: ashari, miny: ashari, minz: ashari, maxx: ashari, maxy: ashari, maxz: ashari, color: adad) -> khali {
+    rl_draw_bounding_box(minx, miny, minz, maxx, maxy, maxz, color);
+}
+
+# ================================================================
+# MODEL / MESH
+# ================================================================
+kar load_model(path: lafz) -> adad {
+    chu rl_load_model(path);
+}
+kar is_model_ready(model: adad) -> adad {
+    chu rl_is_model_ready(model);
+}
+kar unload_model(model: adad) -> khali {
+    rl_unload_model(model);
+}
+kar draw_model(model: adad, px: ashari, py: ashari, pz: ashari, scale: ashari, color: adad) -> khali {
+    rl_draw_model(model, px, py, pz, scale, color);
+}
+kar draw_model_ex(model: adad, px: ashari, py: ashari, pz: ashari, ax: ashari, ay: ashari, az: ashari, angle: ashari, sx: ashari, sy: ashari, sz: ashari, color: adad) -> khali {
+    rl_draw_model_ex(model, px, py, pz, ax, ay, az, angle, sx, sy, sz, color);
+}
+kar draw_model_wires(model: adad, px: ashari, py: ashari, pz: ashari, scale: ashari, color: adad) -> khali {
+    rl_draw_model_wires(model, px, py, pz, scale, color);
+}
+kar draw_billboard(cam: adad, tex: adad, px: ashari, py: ashari, pz: ashari, size: ashari, color: adad) -> khali {
+    rl_draw_billboard(cam, tex, px, py, pz, size, color);
+}
+kar unload_mesh(mesh: adad) -> khali {
+    rl_unload_mesh(mesh);
+}
+kar gen_mesh_cube(w: ashari, h: ashari, l: ashari) -> adad {
+    chu rl_gen_mesh_cube(w, h, l);
+}
+kar gen_mesh_sphere(radius: ashari, rings: adad, slices: adad) -> adad {
+    chu rl_gen_mesh_sphere(radius, rings, slices);
+}
+kar gen_mesh_cylinder(radius: ashari, height: ashari, slices: adad) -> adad {
+    chu rl_gen_mesh_cylinder(radius, height, slices);
+}
+kar gen_mesh_cone(radius: ashari, height: ashari, slices: adad) -> adad {
+    chu rl_gen_mesh_cone(radius, height, slices);
+}
+kar gen_mesh_torus(radius: ashari, size: ashari, rad_seg: adad, sides: adad) -> adad {
+    chu rl_gen_mesh_torus(radius, size, rad_seg, sides);
+}
+kar gen_mesh_plane(w: ashari, l: ashari, res_x: adad, res_z: adad) -> adad {
+    chu rl_gen_mesh_plane(w, l, res_x, res_z);
+}
+kar load_material_default() -> adad {
+    chu rl_load_material_default();
+}
+kar unload_material(mat: adad) -> khali {
+    rl_unload_material(mat);
+}
+kar set_material_texture(mat: adad, map_type: adad, tex: adad) -> khali {
+    rl_set_material_texture(mat, map_type, tex);
+}
+kar update_model_animation(model: adad, anim: adad, frame: adad) -> khali {
+    rl_update_model_animation(model, anim, frame);
+}
+/*kar unload_model_animation(anim: adad) -> khali {
+    rl_unload_model_animation(anim);
+}*/
+
+# ================================================================
+# CAMERA
+# ================================================================
+kar update_camera(cam: adad, mode: adad) -> khali {
+    rl_update_camera(cam, mode);
+}
+
+# ================================================================
+# SHADERS
+# ================================================================
+kar load_shader(vs_path: lafz, fs_path: lafz) -> adad {
+    chu rl_load_shader(vs_path, fs_path);
+}
+kar load_shader_from_memory(vs_code: lafz, fs_code: lafz) -> adad {
+    chu rl_load_shader_from_memory(vs_code, fs_code);
+}
+kar is_shader_ready(shader: adad) -> adad {
+    chu rl_is_shader_ready(shader);
+}
+kar unload_shader(shader: adad) -> khali {
+    rl_unload_shader(shader);
+}
+kar get_shader_location(shader: adad, name: lafz) -> adad {
+    chu rl_get_shader_location(shader, name);
+}
+kar set_shader_value(shader: adad, loc: adad, value: adad, uniform_type: adad) -> khali {
+    rl_set_shader_value(shader, loc, value, uniform_type);
+}
+kar set_shader_value_texture(shader: adad, loc: adad, tex: adad) -> khali {
+    rl_set_shader_value_texture(shader, loc, tex);
+}
+
+# ================================================================
+# INPUT: KEYBOARD
+# ================================================================
+kar is_key_pressed(key: adad) -> adad {
+    chu rl_is_key_pressed(key);
+}
+kar is_key_pressed_repeat(key: adad) -> adad {
+    chu rl_is_key_pressed_repeat(key);
+}
+kar is_key_down(key: adad) -> adad {
+    chu rl_is_key_down(key);
+}
+kar key_held(key: adad) -> adad {
+    chu rl_key_held(key);
+}
+kar is_key_released(key: adad) -> adad {
+    chu rl_is_key_released(key);
+}
+kar is_key_up(key: adad) -> adad {
+    chu rl_is_key_up(key);
+}
+kar get_key_pressed() -> adad {
+    chu rl_get_key_pressed();
+}
+kar get_char_pressed() -> adad {
+    chu rl_get_char_pressed();
+}
+
+# ================================================================
+# INPUT: MOUSE
+# ================================================================
+kar is_mouse_button_pressed(btn: adad) -> adad {
+    chu rl_is_mouse_button_pressed(btn);
+}
+kar is_mouse_button_down(btn: adad) -> adad {
+    chu rl_is_mouse_button_down(btn);
+}
+kar is_mouse_button_released(btn: adad) -> adad {
+    chu rl_is_mouse_button_released(btn);
+}
+kar is_mouse_button_up(btn: adad) -> adad {
+    chu rl_is_mouse_button_up(btn);
+}
+kar get_mouse_x() -> adad {
+    chu rl_get_mouse_x();
+}
+kar get_mouse_y() -> adad {
+    chu rl_get_mouse_y();
+}
+kar get_mouse_wheel() -> ashari {
+    chu rl_get_mouse_wheel_move();
+}
+kar set_mouse_position(x: adad, y: adad) -> khali {
+    rl_set_mouse_position(x, y);
+}
+kar set_mouse_offset(x: adad, y: adad) -> khali {
+    rl_set_mouse_offset(x, y);
+}
+kar set_mouse_scale(sx: ashari, sy: ashari) -> khali {
+    rl_set_mouse_scale(sx, sy);
+}
+kar set_mouse_cursor(cursor: adad) -> khali {
+    rl_set_mouse_cursor(cursor);
+}
+kar get_touch_x() -> adad {
+    chu rl_get_touch_x();
+}
+kar get_touch_y() -> adad {
+    chu rl_get_touch_y();
+}
+kar get_touch_point_count() -> adad {
+    chu rl_get_touch_point_count();
+}
+
+# ================================================================
+# INPUT: GAMEPAD
+# ================================================================
+kar is_gamepad_available(gamepad: adad) -> adad {
+    chu rl_is_gamepad_available(gamepad);
+}
+kar is_gamepad_button_pressed(gamepad: adad, btn: adad) -> adad {
+    chu rl_is_gamepad_button_pressed(gamepad, btn);
+}
+kar is_gamepad_button_down(gamepad: adad, btn: adad) -> adad {
+    chu rl_is_gamepad_button_down(gamepad, btn);
+}
+kar is_gamepad_button_released(gamepad: adad, btn: adad) -> adad {
+    chu rl_is_gamepad_button_released(gamepad, btn);
+}
+kar is_gamepad_button_up(gamepad: adad, btn: adad) -> adad {
+    chu rl_is_gamepad_button_up(gamepad, btn);
+}
+kar get_gamepad_button_pressed() -> adad {
+    chu rl_get_gamepad_button_pressed();
+}
+kar get_gamepad_axis_count(gamepad: adad) -> adad {
+    chu rl_get_gamepad_axis_count(gamepad);
+}
+kar get_gamepad_axis_movement(gamepad: adad, axis: adad) -> ashari {
+    chu rl_get_gamepad_axis_movement(gamepad, axis);
+}
+
+# ================================================================
+# AUDIO
+# ================================================================
+kar init_audio() -> khali {
+    rl_init_audio_device();
+}
+kar close_audio() -> khali {
+    rl_close_audio_device();
+}
+kar is_audio_device_ready() -> adad {
+    chu rl_is_audio_device_ready();
+}
+kar set_master_volume(vol: ashari) -> khali {
+    rl_set_master_volume(vol);
+}
+kar get_master_volume() -> ashari {
+    chu rl_get_master_volume();
+}
+kar load_sound(path: lafz) -> adad {
+    chu rl_load_sound(path);
+}
+kar is_sound_ready(snd: adad) -> adad {
+    chu rl_is_sound_ready(snd);
+}
+kar unload_sound(snd: adad) -> khali {
+    rl_unload_sound(snd);
+}
+kar play_sound(snd: adad) -> khali {
+    rl_play_sound(snd);
+}
+kar stop_sound(snd: adad) -> khali {
+    rl_stop_sound(snd);
+}
+kar pause_sound(snd: adad) -> khali {
+    rl_pause_sound(snd);
+}
+kar resume_sound(snd: adad) -> khali {
+    rl_resume_sound(snd);
+}
+kar is_sound_playing(snd: adad) -> adad {
+    chu rl_is_sound_playing(snd);
+}
+kar set_sound_volume(snd: adad, vol: ashari) -> khali {
+    rl_set_sound_volume(snd, vol);
+}
+kar set_sound_pitch(snd: adad, pitch: ashari) -> khali {
+    rl_set_sound_pitch(snd, pitch);
+}
+kar set_sound_pan(snd: adad, pan: ashari) -> khali {
+    rl_set_sound_pan(snd, pan);
+}
+kar load_music_stream(path: lafz) -> adad {
+    chu rl_load_music_stream(path);
+}
+kar is_music_ready(music: adad) -> adad {
+    chu rl_is_music_ready(music);
+}
+kar unload_music_stream(music: adad) -> khali {
+    rl_unload_music_stream(music);
+}
+kar play_music_stream(music: adad) -> khali {
+    rl_play_music_stream(music);
+}
+kar is_music_stream_playing(music: adad) -> adad {
+    chu rl_is_music_stream_playing(music);
+}
+kar update_music_stream(music: adad) -> khali {
+    rl_update_music_stream(music);
+}
+kar stop_music_stream(music: adad) -> khali {
+    rl_stop_music_stream(music);
+}
+kar pause_music_stream(music: adad) -> khali {
+    rl_pause_music_stream(music);
+}
+kar resume_music_stream(music: adad) -> khali {
+    rl_resume_music_stream(music);
+}
+kar seek_music_stream(music: adad, pos: ashari) -> khali {
+    rl_seek_music_stream(music, pos);
+}
+kar set_music_volume(music: adad, vol: ashari) -> khali {
+    rl_set_music_volume(music, vol);
+}
+kar set_music_pitch(music: adad, pitch: ashari) -> khali {
+    rl_set_music_pitch(music, pitch);
+}
+kar set_music_pan(music: adad, pan: ashari) -> khali {
+    rl_set_music_pan(music, pan);
+}
+kar get_music_time_length(music: adad) -> ashari {
+    chu rl_get_music_time_length(music);
+}
+kar get_music_time_played(music: adad) -> ashari {
+    chu rl_get_music_time_played(music);
+}
+
+# ================================================================
+# UTILITY
+# ================================================================
+kar get_random_value(min: adad, max: adad) -> adad {
+    chu rl_get_random_value(min, max);
+}
+kar set_random_seed(seed: adad) -> khali {
+    rl_set_random_seed(seed);
+}
+kar take_screenshot(path: lafz) -> khali {
+    rl_take_screenshot(path);
+}
+kar open_url(url: lafz) -> khali {
+    rl_open_url(url);
+}
+
+# ================================================================
+# WAVE / AUDIO STREAMING
+# ================================================================
+kar load_wave(path: lafz) -> adad {
+    chu rl_load_wave(path);
+}
+kar is_wave_ready(wave: adad) -> adad {
+    chu rl_is_wave_ready(wave);
+}
+kar unload_wave(wave: adad) -> khali {
+    rl_unload_wave(wave);
+}
+kar load_sound_from_wave(wave: adad) -> adad {
+    chu rl_load_sound_from_wave(wave);
+}
+kar export_wave(wave: adad, path: lafz) -> adad {
+    chu rl_export_wave(wave, path);
+}
+kar update_sound(snd: adad, data: adad, n: adad) -> khali {
+    rl_update_sound(snd, data, n);
+}
+
+# ================================================================
+# GAMEPAD ADVANCED
+# ================================================================
+kar set_gamepad_vibration(gamepad: adad, left_motor: ashari, right_motor: ashari, dur: ashari) -> khali {
+    rl_set_gamepad_vibration(gamepad, left_motor, right_motor, dur);
+}
+
+# ================================================================
+# CAMERA ADVANCED
+# ================================================================
+kar update_camera_pro(cam_ptr: adad, movement: adad, rotation: adad, zoom: ashari) -> khali {
+    rl_update_camera_pro(cam_ptr, movement, rotation, zoom);
+}
+
+# ================================================================
+# TEXT RENDERING HELPERS
+# ================================================================
+kar get_glyph_index(font: adad, codepoint: adad) -> adad {
+    chu rl_get_glyph_index(font, codepoint);
+}
+kar measure_text_ex(font: adad, text: lafz, font_size: ashari, spacing: ashari) -> adad {
+    chu rl_measure_text_ex(font, text, font_size, spacing);
+}

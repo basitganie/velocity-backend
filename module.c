@@ -31,7 +31,7 @@ void module_manager_set_binary_dir(const char *argv0) {
         resolved[len] = '\0';
         char *copy = strdup(resolved);
         char *d = dirname(copy);
-        strncpy(binary_dir, d, MAX_PATH_LEN - 1);
+        vl_strncpy(binary_dir, d, MAX_PATH_LEN);
         free(copy);
         return;
     }
@@ -43,7 +43,7 @@ void module_manager_set_binary_dir(const char *argv0) {
         char *last = strrchr(path, '\\');
         if (!last) last = strrchr(path, '/');
         if (last) *last = '\0';
-        strncpy(binary_dir, path, MAX_PATH_LEN - 1);
+        vl_strncpy(binary_dir, path, MAX_PATH_LEN);
         return;
     }
 #endif
@@ -53,7 +53,7 @@ void module_manager_set_binary_dir(const char *argv0) {
         char *p = copy + strlen(copy) - 1;
         while (p > copy && *p != '/' && *p != '\\') p--;
         if (p > copy) *p = '\0';
-        strncpy(binary_dir, copy, MAX_PATH_LEN - 1);
+        vl_strncpy(binary_dir, copy, MAX_PATH_LEN);
         free(copy);
     }
 }
@@ -155,25 +155,37 @@ bool module_manager_load_module(ModuleManager *mgr,
     char *asm_path = module_manager_find_asm(mgr, module_name);
     ImportInfo *imp = &mgr->imports[mgr->import_count++];
     memset(imp, 0, sizeof(*imp));
-    strncpy(imp->module_name, module_name,   MAX_TOKEN_LEN - 1);
-    strncpy(imp->file_path,   primary,       MAX_PATH_LEN  - 1);
+    vl_strncpy(imp->module_name, module_name,   MAX_TOKEN_LEN);
+    vl_strncpy(imp->file_path,   primary,       MAX_PATH_LEN);
 
     const char *ext = strrchr(primary, '.');
     imp->is_native_asm  = (ext && strcmp(ext, ".asm") == 0);
     imp->is_standard_lib = false;
 
     if (asm_path) {
-        strncpy(imp->asm_path, asm_path, MAX_PATH_LEN - 1);
+        vl_strncpy(imp->asm_path, asm_path, MAX_PATH_LEN);
         free(asm_path);
     }
 
-    if (strcmp(module_name, "sdl_native") == 0) {
+    if (strcmp(module_name, "sdl_native") == 0 ||
+        strcmp(module_name, "sdl2") == 0) {
 #ifdef _WIN32
-        strncpy(imp->link_flags, "-lSDL2", sizeof(imp->link_flags)-1);
+        vl_strncpy(imp->link_flags, "-lSDL2main -lSDL2",
+                sizeof(imp->link_flags));
 #else
-        strncpy(imp->link_flags,
-                "-L/usr/lib/x86_64-linux-gnu -lSDL2",
-                sizeof(imp->link_flags)-1);
+        vl_strncpy(imp->link_flags,
+                "-lSDL2",
+                sizeof(imp->link_flags));
+#endif
+    } else if (strcmp(module_name, "raylib") == 0) {
+#ifdef _WIN32
+        vl_strncpy(imp->link_flags,
+                "-lraylib -lopengl32 -lgdi32 -lwinmm",
+                sizeof(imp->link_flags));
+#else
+        vl_strncpy(imp->link_flags,
+                "-lraylib -lGL -lm -lpthread -ldl -lrt -lX11",
+                sizeof(imp->link_flags));
 #endif
     }
 

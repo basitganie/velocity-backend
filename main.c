@@ -36,6 +36,7 @@ static void print_help(const char *prog) {
         "  --target <triple>      Cross-compile target. Supported:\n"
         "                           aarch64-linux-android  (Android AArch64)\n"
         "  --stdlib <path>        Extra stdlib search path\n"
+        "  --ldflags \"<flags>\"   Extra linker flags (e.g. -lraylib -L/usr/local/lib)\n"
         "  --emit-asm             Keep generated .asm/.s file\n"
         "  --no-link              Stop after assemble (.o only)\n\n"
         "  AArch64-Android env vars:\n"
@@ -43,7 +44,7 @@ static void print_help(const char *prog) {
         "    VELOCITY_NDK_CLANG   Path to aarch64-linux-android21-clang\n\n"
 
         "Author: Basit Ahmad Ganie <basitahmed1412@gmail.com>\n",
-        VERSION_STRING, prog, prog
+        VERSION_STRING, prog
     );
 }
 
@@ -67,6 +68,13 @@ static char* stem(const char *path) {
 static int run_cmd(const char *cmd, bool verbose) {
     if (verbose) { printf("  [cmd] %s\n", cmd); fflush(stdout); }
     return system(cmd);
+}
+
+static void append_flag(char *dst, size_t dst_sz, const char *flag) {
+    if (!dst || dst_sz == 0 || !flag || !flag[0]) return;
+    if (strlen(dst) + strlen(flag) + 2 >= dst_sz) return;
+    strncat(dst, " ", dst_sz - strlen(dst) - 1);
+    strncat(dst, flag, dst_sz - strlen(dst) - 1);
 }
 
 /* Run cmd and capture stderr into buf (at most bufsz-1 chars). Returns exit code. */
@@ -123,17 +131,51 @@ static void compile(CompilerOptions *opts) {
 
     ModuleManager mgr;
     module_manager_init(&mgr);
-    if (opts->stdlib_path)
-        strncpy(mgr.stdlib_path, opts->stdlib_path, MAX_PATH_LEN-1);
+    if (opts->stdlib_path) {
+        vl_strncpy(mgr.stdlib_path, opts->stdlib_path, MAX_PATH_LEN);
+    } else {
+        char *src_dir = get_directory(src);
+        if (src_dir) { module_manager_add_search_path(&mgr, src_dir); free(src_dir); }
+    }
 
-    char *src_dir = get_directory(src);
-    if (src_dir) { module_manager_add_search_path(&mgr, src_dir); free(src_dir); }
+    /* Pre-scan imports: register saabit constants from module .vel files
+     * BEFORE parsing the main program, so bare constant names (KEY_ESCAPE
+     * etc.) resolve to integer literals at parse time rather than becoming
+     * unknown AST_IDENTIFIER nodes.
+     *
+     * We do a quick token scan of the source to find `anaw <mod>;` lines,
+     * call module_manager_load_module() to build the search path list, then
+     * call parser_preload_module_consts() on each found .vel file. */
+    {
+        Lexer pre_lex; lexer_init(&pre_lex, source);
+        Token *pre_toks = (Token*)malloc(sizeof(Token) * MAX_TOKENS);
+        int pre_ntok = lexer_tokenize(&pre_lex, pre_toks, MAX_TOKENS);
+        /* First pass: load all modules (builds search paths internally) */
+        for (int pi = 0; pi < pre_ntok - 1; pi++) {
+            if (pre_toks[pi].type != TOK_ANAW) continue;
+            if (pre_toks[pi+1].type != TOK_IDENTIFIER) continue;
+            module_manager_load_module(&mgr, pre_toks[pi+1].value, src);
+        }
+        /* Second pass: preload saabit constants from each .vel module */
+        for (int pi = 0; pi < pre_ntok - 1; pi++) {
+            if (pre_toks[pi].type != TOK_ANAW) continue;
+            if (pre_toks[pi+1].type != TOK_IDENTIFIER) continue;
+            const char *mod = pre_toks[pi+1].value;
+            char *mod_path = module_manager_find_module(&mgr, mod);
+            if (!mod_path) continue;
+            const char *ext = strrchr(mod_path, '.');
+            if (ext && strcmp(ext, ".vel") == 0)
+                parser_preload_module_consts(mod_path);
+            free(mod_path);
+        }
+        free(pre_toks);
+    }
 
     Lexer lexer; lexer_init(&lexer, source);
     Token *tokens = (Token*)malloc(sizeof(Token) * MAX_TOKENS);
     int ntokens = lexer_tokenize(&lexer, tokens, MAX_TOKENS);
 
-    Parser parser; parser_init(&parser, tokens, ntokens);
+    Parser parser; parser_init_no_reset(&parser, tokens, ntokens);
     ASTNode *ast = parse_program(&parser);
 
     for (int i = 0; i < ast->data.program.import_count; i++) {
@@ -143,7 +185,7 @@ static void compile(CompilerOptions *opts) {
 
     char *asm_file = make_path(out, ".asm");
     FILE *asm_fp = fopen(asm_file, "w");
-    if (!asm_fp) error("Cannot create: %s", asm_file);
+    if (!asm_fp) error(ERR_SYSTEM, "Cannot create: %s", asm_file);
 
     CodeGen cg;
     codegen_init(&cg, asm_fp, &mgr, target_win, opts->target_aarch64,
@@ -154,7 +196,7 @@ static void compile(CompilerOptions *opts) {
         for (int i = 0; i < ast->data.program.function_count; i++) {
             ASTNode *fn = ast->data.program.functions[i];
             if (strcmp(fn->data.function.name, "main") == 0) {
-                strncpy(fn->data.function.name, "main_vel", MAX_TOKEN_LEN-1);
+                vl_strncpy(fn->data.function.name, "main_vel", MAX_TOKEN_LEN);
                 break;
             }
         }
@@ -230,7 +272,7 @@ static void compile(CompilerOptions *opts) {
             if (!asm_src) {
                 /* Check for .vel source */
                 char vel_src[MAX_PATH_LEN];
-                strncpy(vel_src, imp->file_path, MAX_PATH_LEN-1);
+                vl_strncpy(vel_src, imp->file_path, MAX_PATH_LEN);
                 dot = strrchr(vel_src, '.');
                 /* imp->file_path might already be .vel or might have no extension */
                 bool is_vel_src = (dot && strcmp(dot, ".vel")==0);
@@ -289,8 +331,9 @@ static void compile(CompilerOptions *opts) {
             if (is_ndk_ld)
                 snprintf(cmd, sizeof(cmd),
                          "%s --target=aarch64-linux-android21 -static"
-                         " \"%s\"%s -o \"%s\" -lc",
-                         ld, obj_file, extra_objs, out);
+                         " \"%s\"%s -o \"%s\" -lc%s",
+                         ld, obj_file, extra_objs, out,
+                         opts->extra_link_flags ? opts->extra_link_flags : "");
             else {
                 /* GNU cross-gcc: use bare ld directly — no libc needed
                    (io stdlib uses raw Linux syscalls only) */
@@ -298,8 +341,9 @@ static void compile(CompilerOptions *opts) {
                 const char *ld_env = getenv("VELOCITY_NDK_LD");
                 if (ld_env) bare_ld = ld_env;
                 snprintf(cmd, sizeof(cmd),
-                         "%s -static \"%s\"%s -o \"%s\"",
-                         bare_ld, obj_file, extra_objs, out);
+                         "%s -static \"%s\"%s -o \"%s\"%s",
+                         bare_ld, obj_file, extra_objs, out,
+                         opts->extra_link_flags ? opts->extra_link_flags : "");
             }
             if (verbose) printf("[velocity] link (aarch64): %s\n", cmd);
             char lderr[1024] = "";
@@ -383,13 +427,18 @@ static void compile(CompilerOptions *opts) {
     if (!opts->no_link) {
         if (target_win) {
             snprintf(cmd, sizeof(cmd),
-                     "gcc -o \"%s\" \"%s\"%s%s -lmsvcrt -lkernel32",
-                     out, obj_file, extra_objs, extra_flags);
+                     "gcc -o \"%s\" \"%s\"%s%s%s -lmsvcrt -lkernel32",
+                     out, obj_file, extra_objs, extra_flags,
+                     opts->extra_link_flags ? opts->extra_link_flags : "");
         } else {
+            /* Use gcc as linker on Linux: resolves -lraylib/-lSDL2 via system
+               library search paths, handles transitive shared-lib deps.
+               -no-pie       : velocity emits position-dependent _start code.
+               -nostartfiles : velocity has its own _start; skip crt1/crti/crtn. */
             snprintf(cmd, sizeof(cmd),
-                     "ld -dynamic-linker /lib64/ld-linux-x86-64.so.2"
-                     " \"%s\"%s%s -o \"%s\"",
-                     obj_file, extra_objs, extra_flags, out);
+                     "gcc -no-pie -nostartfiles -o \"%s\" \"%s\"%s%s%s",
+                     out, obj_file, extra_objs, extra_flags,
+                     opts->extra_link_flags ? opts->extra_link_flags : "");
         }
         if (verbose) printf("[velocity] link: %s\n", cmd);
         if (run_cmd(cmd, false) != 0) {
@@ -428,8 +477,10 @@ int main(int argc, char *argv[]) {
 
     CompilerOptions opts;
     memset(&opts, 0, sizeof(opts));
+    char user_ldflags[2048] = "";
     opts.target_windows = (bool)HOST_WINDOWS;
     opts.target_aarch64 = (bool)HOST_AARCH64;
+    opts.extra_link_flags = user_ldflags;
     /* On AArch64, default assembler/linker to system tools if not set */
 #if HOST_AARCH64
     if (!getenv("VELOCITY_NDK_AS"))    setenv("VELOCITY_NDK_AS",    "as",  0);
@@ -468,6 +519,14 @@ int main(int argc, char *argv[]) {
         }
         if (!strcmp(arg,"--stdlib") && i+1<argc) {
             opts.stdlib_path = argv[++i]; continue;
+        }
+        if (!strcmp(arg,"--ldflags") && i+1<argc) {
+            append_flag(user_ldflags, sizeof(user_ldflags), argv[++i]);
+            continue;
+        }
+        if (!strncmp(arg, "-l", 2) || !strncmp(arg, "-L", 2) || !strncmp(arg, "-Wl,", 4)) {
+            append_flag(user_ldflags, sizeof(user_ldflags), arg);
+            continue;
         }
         if (arg[0]=='-') {
             fprintf(stderr,"error: unknown option '%s'\n"

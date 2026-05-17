@@ -1,0 +1,431 @@
+anaw sdl2;
+
+# ============================================================
+# Velocity SDL2 Module v1.0
+# Links automatically with -lSDL2 (Linux) / -lSDL2main -lSDL2 (Windows)
+# ============================================================
+
+# SDL_INIT flags
+saabit SDL_INIT_VIDEO    = 32;
+saabit SDL_INIT_AUDIO    = 16;
+saabit SDL_INIT_EVENTS   = 16384;
+saabit SDL_INIT_EVERYTHING = 62001;
+
+# SDL_WindowFlags
+saabit SDL_WINDOW_SHOWN       = 4;
+saabit SDL_WINDOW_RESIZABLE   = 32;
+saabit SDL_WINDOW_FULLSCREEN  = 1;
+saabit SDL_WINDOW_BORDERLESS  = 16;
+saabit SDL_WINDOW_CENTERED    = 805240832;
+
+# SDL_RendererFlags
+saabit SDL_RENDERER_ACCELERATED = 2;
+saabit SDL_RENDERER_PRESENTVSYNC = 4;
+saabit SDL_RENDERER_SOFTWARE  = 1;
+
+# SDL event types
+saabit SDL_QUIT          = 256;
+saabit SDL_KEYDOWN       = 768;
+saabit SDL_KEYUP         = 769;
+saabit SDL_MOUSEMOTION   = 1024;
+saabit SDL_MOUSEBUTTONDOWN = 1025;
+saabit SDL_MOUSEBUTTONUP = 1026;
+saabit SDL_MOUSEWHEEL    = 1027;
+
+# SDL keycodes (SDLK_)
+saabit SDLK_ESCAPE  = 27;
+saabit SDLK_RETURN  = 13;
+saabit SDLK_SPACE   = 32;
+saabit SDLK_UP      = 1073741906;
+saabit SDLK_DOWN    = 1073741905;
+saabit SDLK_LEFT    = 1073741904;
+saabit SDLK_RIGHT   = 1073741903;
+
+# keys
+saabit SDLK_0 = 48;
+saabit SDLK_1 = 49;
+saabit SDLK_2 = 50;
+saabit SDLK_3 = 51;
+saabit SDLK_4 = 52;
+saabit SDLK_5 = 53;
+saabit SDLK_6 = 54;
+saabit SDLK_7 = 55;
+saabit SDLK_8 = 56;
+saabit SDLK_9 = 57;
+
+saabit SDLK_a = 97;
+saabit SDLK_b = 98;
+saabit SDLK_c = 99;
+saabit SDLK_d = 100;
+saabit SDLK_e = 101;
+saabit SDLK_f = 102;
+saabit SDLK_g = 103;
+saabit SDLK_h = 104;
+saabit SDLK_i = 105;
+saabit SDLK_j = 106;
+saabit SDLK_k = 107;
+saabit SDLK_l = 108;
+saabit SDLK_m = 109;
+saabit SDLK_n = 110;
+saabit SDLK_o = 111;
+saabit SDLK_p = 112;
+saabit SDLK_q = 113;
+saabit SDLK_r = 114;
+saabit SDLK_s = 115;
+saabit SDLK_t = 116;
+saabit SDLK_u = 117;
+saabit SDLK_v = 118;
+saabit SDLK_w = 119;
+saabit SDLK_x = 120;
+saabit SDLK_y = 121;
+saabit SDLK_z = 122;
+
+saabit SDLK_A = 65;
+saabit SDLK_B = 66;
+saabit SDLK_C = 67;
+saabit SDLK_D = 68;
+saabit SDLK_E = 69;
+saabit SDLK_F = 70;
+saabit SDLK_G = 71;
+saabit SDLK_H = 72;
+saabit SDLK_I = 73;
+saabit SDLK_J = 74;
+saabit SDLK_K = 75;
+saabit SDLK_L = 76;
+saabit SDLK_M = 77;
+saabit SDLK_N = 78;
+saabit SDLK_O = 79;
+saabit SDLK_P = 80;
+saabit SDLK_Q = 81;
+saabit SDLK_R = 82;
+saabit SDLK_S = 83;
+saabit SDLK_T = 84;
+saabit SDLK_U = 85;
+saabit SDLK_V = 86;
+saabit SDLK_W = 87;
+saabit SDLK_X = 88;
+saabit SDLK_Y = 89;
+saabit SDLK_Z = 90;
+
+saabit SDLK_TAB        = 9;
+saabit SDLK_BACKSPACE  = 8;
+
+saabit SDLK_LSHIFT     = 1073742049;
+saabit SDLK_RSHIFT     = 1073742053;
+
+saabit SDLK_LCTRL      = 1073742048;
+saabit SDLK_RCTRL      = 1073742052;
+
+saabit SDLK_LALT       = 1073742050;
+saabit SDLK_RALT       = 1073742054;
+
+saabit SDLK_F1         = 1073741882;
+saabit SDLK_F2         = 1073741883;
+saabit SDLK_F3         = 1073741884;
+saabit SDLK_F4         = 1073741885;
+saabit SDLK_F5         = 1073741886;
+saabit SDLK_F6         = 1073741887;
+saabit SDLK_F7         = 1073741888;
+saabit SDLK_F8         = 1073741889;
+saabit SDLK_F9         = 1073741890;
+saabit SDLK_F10        = 1073741891;
+saabit SDLK_F11        = 1073741892;
+saabit SDLK_F12        = 1073741893;
+
+# SDL blend modes
+saabit SDL_BLENDMODE_NONE  = 0;
+saabit SDL_BLENDMODE_BLEND = 1;
+saabit SDL_BLENDMODE_ADD   = 2;
+saabit SDL_BLENDMODE_MOD   = 4;
+
+# SDL mouse buttons
+saabit SDL_BUTTON_LEFT   = 1;
+saabit SDL_BUTTON_MIDDLE = 2;
+saabit SDL_BUTTON_RIGHT  = 3;
+
+# ---- Core ----------------------------------------------------
+
+kar init(flags: adad) -> adad {
+    chu sdl2__init(flags);
+}
+
+kar quit() -> khali {
+    sdl2__quit();
+}
+
+kar get_error() -> lafz {
+    chu sdl2__get_error();
+}
+
+kar delay(ms: adad) -> khali {
+    sdl2__delay(ms);
+}
+
+kar get_ticks() -> adad {
+    chu sdl2__get_ticks();
+}
+
+# ---- Window --------------------------------------------------
+
+# create_window(title, x, y, w, h, flags) -> adad (window ptr)
+kar create_window(title: lafz, x: adad, y: adad, w: adad, h: adad, flags: adad) -> adad {
+    chu sdl2__create_window(title, x, y, w, h, flags);
+}
+
+kar destroy_window(win: adad) -> khali {
+    sdl2__destroy_window(win);
+}
+
+kar set_window_title(win: adad, title: lafz) -> khali {
+    sdl2__set_window_title(win, title);
+}
+
+# ---- Renderer ------------------------------------------------
+
+# create_renderer(window, index, flags) -> adad (renderer ptr)
+kar create_renderer(win: adad, index: adad, flags: adad) -> adad {
+    chu sdl2__create_renderer(win, index, flags);
+}
+
+kar destroy_renderer(ren: adad) -> khali {
+    sdl2__destroy_renderer(ren);
+}
+
+kar render_clear(ren: adad) -> adad {
+    chu sdl2__render_clear(ren);
+}
+
+kar render_present(ren: adad) -> khali {
+    sdl2__render_present(ren);
+}
+
+kar set_draw_color(ren: adad, r: adad, g: adad, b: adad, a: adad) -> adad {
+    chu sdl2__set_render_draw_color(ren, r, g, b, a);
+}
+
+kar render_fill_rect(ren: adad, x: adad, y: adad, w: adad, h: adad) -> adad {
+    ath r: adad = make_rect(x, y, w, h);
+    chu sdl2__render_fill_rect(ren, r);
+}
+
+kar render_draw_rect(ren: adad, x: adad, y: adad, w: adad, h: adad) -> adad {
+    ath r: adad = make_rect(x, y, w, h);
+    chu sdl2__render_draw_rect(ren, r);
+}
+
+kar render_draw_line(ren: adad, x1: adad, y1: adad, x2: adad, y2: adad) -> adad {
+    chu sdl2__render_draw_line(ren, x1, y1, x2, y2);
+}
+
+kar render_draw_point(ren: adad, x: adad, y: adad) -> adad {
+    chu sdl2__render_draw_point(ren, x, y);
+}
+
+kar render_copy(ren: adad, tex: adad, src: adad, dst: adad) -> adad {
+    chu sdl2__render_copy(ren, tex, src, dst);
+}
+
+kar set_blend_mode(ren: adad, mode: adad) -> adad {
+    chu sdl2__set_render_blend_mode(ren, mode);
+}
+
+# ---- Events --------------------------------------------------
+
+# poll_event() -> adad  (returns ptr to static event buf, or 0 if no event)
+kar poll_event() -> adad {
+    chu sdl2__poll_event_auto();
+}
+
+kar event_type(event_buf: adad) -> adad {
+    chu sdl2__event_type(event_buf);
+}
+
+kar event_key_sym(event_buf: adad) -> adad {
+    chu sdl2__event_key_sym(event_buf);
+}
+
+kar event_key_scancode(event_buf: adad) -> adad {
+    chu sdl2__event_key_scancode(event_buf);
+}
+
+# ---- Input ---------------------------------------------------
+
+kar show_cursor(toggle: adad) -> adad {
+    chu sdl2__show_cursor(toggle);
+}
+
+# get_keyboard_state() -> adad (ptr to key state array)
+kar get_keyboard_state() -> adad {
+    chu sdl2__get_keyboard_state(0);
+}
+
+# key_held(keys: adad, scancode: adad) -> adad (1 = held, 0 = not)
+kar key_held(keys: adad, scancode: adad) -> adad {
+    chu sdl2__key_held(keys, scancode);
+}
+
+# get_mouse_state(x_ptr, y_ptr) -> adad (button mask)
+kar get_mouse_state(x_ptr: adad, y_ptr: adad) -> adad {
+    chu sdl2__get_mouse_state(x_ptr, y_ptr);
+}
+
+# ---- Textures ------------------------------------------------
+
+kar load_bmp(path: lafz) -> adad {
+    chu sdl2__load_bmp(path);
+}
+
+kar create_texture(ren: adad, surf: adad) -> adad {
+    chu sdl2__create_texture_from_surface(ren, surf);
+}
+
+kar destroy_texture(tex: adad) -> khali {
+    sdl2__destroy_texture(tex);
+}
+
+kar free_surface(surf: adad) -> khali {
+    sdl2__free_surface(surf);
+}
+
+kar set_texture_alpha(tex: adad, alpha: adad) -> adad {
+    chu sdl2__set_texture_alpha(tex, alpha);
+}
+
+kar set_texture_blend(tex: adad, mode: adad) -> adad {
+    chu sdl2__set_texture_blend(tex, mode);
+}
+
+# ---- Rect helpers --------------------------------------------
+
+# make_rect(x, y, w, h) -> adad (ptr to static SDL_Rect buf)
+kar make_rect(x: adad, y: adad, w: adad, h: adad) -> adad {
+    chu sdl2__make_rect(x, y, w, h);
+}
+
+# ---- Utility aliases -----------------------------------------
+
+kar fill_rect(ren: adad, x: adad, y: adad, w: adad, h: adad) -> adad {
+    ath r: adad = make_rect(x, y, w, h);
+    chu render_fill_rect(ren, r);
+}
+
+kar draw_rect(ren: adad, x: adad, y: adad, w: adad, h: adad) -> adad {
+    ath r: adad = make_rect(x, y, w, h);
+    chu render_draw_rect(ren, r);
+}
+
+kar clear_black(ren: adad) -> khali {
+    set_draw_color(ren, 0, 0, 0, 255);
+    render_clear(ren);
+}
+
+kar clear_white(ren: adad) -> khali {
+    set_draw_color(ren, 255, 255, 255, 255);
+    render_clear(ren);
+}
+
+# ============================================================
+# SDL2_ttf bindings
+# ============================================================
+
+saabit SDL_TEXTINPUT = 771;
+
+# ttf_init() -> adad  (0 = success)
+kar ttf_init() -> adad {
+    chu sdl2__ttf_init();
+}
+
+kar ttf_quit() -> khali {
+    sdl2__ttf_quit();
+}
+
+# ttf_open_font(path, size) -> adad  (font ptr, 0 = error)
+kar ttf_open_font(path: lafz, size: adad) -> adad {
+    chu sdl2__ttf_open_font(path, size);
+}
+
+kar ttf_close_font(font: adad) -> khali {
+    sdl2__ttf_close_font(font);
+}
+
+# ttf_render(font, text, r, g, b) -> adad  (surface ptr)
+kar ttf_render_solid(font: adad, text: lafz, r: adad, g: adad, b: adad) -> adad {
+    ath color = sdl2__make_color(r, g, b, 255);
+    chu sdl2__ttf_render_solid(font, text, color);
+}
+
+kar ttf_render_blended(font: adad, text: lafz, r: adad, g: adad, b: adad) -> adad {
+    ath color = sdl2__make_color(r, g, b, 255);
+    chu sdl2__ttf_render_blended(font, text, color);
+}
+
+# ttf_text_texture(ren, font, text, r, g, b) -> adad  (texture ptr)
+# convenience: render text -> surface -> texture, free surface
+kar ttf_text_texture(ren: adad, font: adad, text: lafz, r: adad, g: adad, b: adad) -> adad {
+    ath surf = ttf_render_blended(font, text, r, g, b);
+    agar surf == 0 { chu 0; }
+    ath tex = create_texture(ren, surf);
+    free_surface(surf);
+    chu tex;
+}
+
+# ttf_draw_text(ren, font, text, x, y, r, g, b) -> khali
+# render text string at pixel position x,y
+kar ttf_draw_text(ren: adad, font: adad, text: lafz, x: adad, y: adad, r: adad, g: adad, b: adad) -> khali {
+    ath surf = ttf_render_blended(font, text, r, g, b);
+    agar surf == 0 { chu; }
+    ath tex = create_texture(ren, surf);
+    ath mut tw = 0;
+    ath mut th = 0;
+    sdl2__query_texture(tex, 0, 0, &tw, &th);
+    free_surface(surf);
+    ath dst = make_rect(x, y, tw, th);
+    sdl2__render_copy(ren, tex, 0, dst);
+    destroy_texture(tex);
+}
+
+# ttf_text_width(font, text) -> adad
+kar ttf_text_width(font: adad, text: lafz) -> adad {
+    ath mut w = 0;
+    ath mut h = 0;
+    sdl2__ttf_size_text(font, text, &w, &h);
+    chu w;
+}
+
+# ttf_font_height(font) -> adad
+kar ttf_font_height(font: adad) -> adad {
+    chu sdl2__ttf_font_height(font);
+}
+
+kar ttf_line_skip(font: adad) -> adad {
+    chu sdl2__ttf_font_line_skip(font);
+}
+
+# ============================================================
+# Mouse event accessors
+# ============================================================
+
+kar event_mouse_x(ev: adad) -> adad {
+    chu sdl2__event_mouse_x(ev);
+}
+
+kar event_mouse_y(ev: adad) -> adad {
+    chu sdl2__event_mouse_y(ev);
+}
+
+kar event_mouse_button(ev: adad) -> adad {
+    chu sdl2__event_mouse_button(ev);
+}
+
+kar event_wheel_y(ev: adad) -> adad {
+    chu sdl2__event_wheel_y(ev);
+}
+
+# event_text_input(ev) -> lafz  (the typed character string)
+kar event_text_input(ev: adad) -> lafz {
+    chu sdl2__event_text_input(ev);
+}
+
+kar make_color(r: adad, g: adad, b: adad, a: adad) -> adad {
+    chu sdl2__make_color(r, g, b, a);
+}

@@ -18,6 +18,75 @@
  */
 
 #include "velocity.h"
+#include <strings.h>
+#include <ctype.h>
+
+typedef struct {
+    char name[MAX_TOKEN_LEN];
+    long long value;
+} EnumConst;
+
+static EnumConst g_enum_consts[4096];
+static int g_enum_const_count = 0;
+
+static bool enum_const_lookup(const char *name, long long *out) {
+    for (int i = 0; i < g_enum_const_count; i++) {
+        if (strcmp(g_enum_consts[i].name, name) == 0) {
+            if (out) *out = g_enum_consts[i].value;
+            return true;
+        }
+    }
+    /* Fallback: case-insensitive for things like Direction.FORWARD */
+    for (int i = 0; i < g_enum_const_count; i++) {
+        if (strcasecmp(g_enum_consts[i].name, name) == 0) {
+            if (out) *out = g_enum_consts[i].value;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void enum_const_add(Token name_tok, long long value) {
+    long long old = 0;
+    if (enum_const_lookup(name_tok.value, &old)) {
+        error_at(ERR_SYNTAX, name_tok.line, name_tok.column,
+                 "duplicate enum member '%s'", name_tok.value);
+    }
+    if (g_enum_const_count >= (int)(sizeof(g_enum_consts)/sizeof(g_enum_consts[0])))
+        error_at(ERR_SYNTAX, name_tok.line, name_tok.column, "too many enum members");
+    vl_strncpy(g_enum_consts[g_enum_const_count].name, name_tok.value, MAX_TOKEN_LEN);
+    g_enum_consts[g_enum_const_count].value = value;
+    g_enum_const_count++;
+}
+
+static long long parse_enum_int_literal(Parser *p) {
+    bool neg = false;
+    if (parser_match(p, TOK_MINUS)) {
+        neg = true;
+        parser_advance(p);
+    }
+    Token t = parser_current(p);
+    long long v = 0;
+    if (t.type == TOK_INTEGER) {
+        v = strtoll(t.value, NULL, 10);
+    } else if (t.type == TOK_HEX) {
+        v = strtoll(t.value, NULL, 16);
+    } else if (t.type == TOK_BINARY) {
+        for (int i = 0; t.value[i]; i++) {
+            v = (v << 1) + (t.value[i] == '1' ? 1 : 0);
+        }
+    } else if (t.type == TOK_OCTAL) {
+        v = strtoll(t.value, NULL, 8);
+    } else if (t.type == TOK_IDENTIFIER) {
+        if (!enum_const_lookup(t.value, &v))
+            error_at(ERR_SYNTAX, t.line, t.column,
+                     "enum value must be an integer literal or earlier enum member");
+    } else {
+        error_at(ERR_SYNTAX, t.line, t.column, "expected enum integer literal");
+    }
+    parser_advance(p);
+    return neg ? -v : v;
+}
 
 /* ------------------------------------------------------------
  *  Type parsing
@@ -28,6 +97,7 @@ static ValueType parse_type_token(Token tok) {
         case TOK_ADAD:     return TYPE_INT;
         case TOK_UADAD:    return TYPE_UINT;
         case TOK_UADAD8:   return TYPE_UINT8;
+        case TOK_HARF:     return TYPE_UINT8;
         case TOK_BOOL:     return TYPE_BOOL;
         case TOK_ASHARI:   return TYPE_F64;
         case TOK_ASHARI32: return TYPE_F32;
@@ -42,14 +112,43 @@ static ValueType parse_type_token(Token tok) {
             break;
         default: break;
     }
-    error_at(tok.line, tok.column,
+    error_at(ERR_SYNTAX, tok.line, tok.column,
              "expected type name, got '%s'", tok.value);
     return TYPE_INT;
+}
+
+/* Consume an identifier generic suffix like <T, U>. */
+static void parser_skip_generic_suffix(Parser *parser) {
+    if (!parser_match(parser, TOK_LT)) return;
+    int depth = 0;
+    while (!parser_match(parser, TOK_EOF)) {
+        Token t = parser_current(parser);
+        if (t.type == TOK_LT) depth++;
+        else if (t.type == TOK_GT) {
+            depth--;
+            parser_advance(parser);
+            if (depth <= 0) return;
+            continue;
+        }
+        parser_advance(parser);
+    }
+    error_at(ERR_SYNTAX, parser_current(parser).line, parser_current(parser).column,
+             "unterminated generic type argument list");
 }
 
 static ValueType parse_type(Parser *parser, TypeInfo **out_info) {
     if (out_info) *out_info = NULL;
     Token tok = parser_current(parser);
+
+    /* Pointer type: *T  (e.g. *adad, *lafz, *MyStruct) */
+    if (tok.type == TOK_STAR) {
+        parser_advance(parser);
+        TypeInfo *inner_info = NULL;
+        parse_type(parser, &inner_info);
+        if (inner_info) free(inner_info);
+        if (out_info) *out_info = NULL;
+        return TYPE_PTR;
+    }
 
     /* Array type: [ElemType] or [ElemType; N] or [[ElemType; M]; N] for 2D */
     if (tok.type == TOK_LBRACKET) {
@@ -58,7 +157,7 @@ static ValueType parse_type(Parser *parser, TypeInfo **out_info) {
         ValueType elem = parse_type(parser, &elem_info);
 
         TypeInfo *ti = (TypeInfo*)calloc(1, sizeof(TypeInfo));
-        if (!ti) error("Out of memory");
+        if (!ti) error(ERR_FATAL, "Out of memory");
         ti->kind = TYPE_ARRAY;
         ti->elem_type = elem;
         ti->elem_typeinfo = elem_info;
@@ -74,11 +173,17 @@ static ValueType parse_type(Parser *parser, TypeInfo **out_info) {
             parser_expect(parser, TOK_RBRACKET);
             ti->array_len = atoi(len_tok.value);
             if (ti->array_len <= 0)
-                error_at(len_tok.line, len_tok.column,
+                error_at(ERR_SYNTAX, len_tok.line, len_tok.column,
                          "array length must be > 0 (got %d)", ti->array_len);
         } else {
-            error_at(tok.line, tok.column,
+            error_at(ERR_SYNTAX, tok.line, tok.column,
                      "expected ']' or '; N' in array type");
+        }
+        if (parser_match(parser, TOK_QUESTION)) {
+            parser_advance(parser);
+            ti->kind = TYPE_OPT_ARRAY;
+            if (out_info) *out_info = ti;
+            return TYPE_OPT_ARRAY;
         }
         if (out_info) *out_info = ti;
         return TYPE_ARRAY;
@@ -100,10 +205,10 @@ static ValueType parse_type(Parser *parser, TypeInfo **out_info) {
         }
         parser_expect(parser, TOK_RPAREN);
         if (count < 2)
-            error_at(tok.line, tok.column,
+            error_at(ERR_SYNTAX, tok.line, tok.column,
                      "tuple types require at least 2 elements");
         TypeInfo *ti = (TypeInfo*)calloc(1, sizeof(TypeInfo));
-        if (!ti) error("Out of memory");
+        if (!ti) error(ERR_FATAL, "Out of memory");
         ti->kind = TYPE_TUPLE;
         ti->tuple_types = types;
         ti->tuple_count = count;
@@ -118,12 +223,53 @@ static ValueType parse_type(Parser *parser, TypeInfo **out_info) {
         strcmp(tok.value, "string") != 0 &&
         strcmp(tok.value, "String") != 0) {
         parser_advance(parser);
+        /* Allow erased generic usage in type positions: Point<adad>. */
+        parser_skip_generic_suffix(parser);
         TypeInfo *ti = (TypeInfo*)calloc(1, sizeof(TypeInfo));
-        if (!ti) error("Out of memory");
+        if (!ti) error(ERR_FATAL, "Out of memory");
         ti->kind = TYPE_STRUCT;
-        strncpy(ti->struct_name, tok.value, MAX_TOKEN_LEN - 1);
+        vl_strncpy(ti->struct_name, tok.value, MAX_TOKEN_LEN);
+        if (parser_match(parser, TOK_QUESTION)) {
+            parser_advance(parser);
+            ti->kind = TYPE_OPT_STRUCT;
+            if (out_info) *out_info = ti;
+            return TYPE_OPT_STRUCT;
+        }
         if (out_info) *out_info = ti;
         return TYPE_STRUCT;
+    }
+
+    /* Function pointer type: kar(T1, T2, ...) -> RetType */
+    if (tok.type == TOK_KAR) {
+        parser_advance(parser);   /* consume 'kar' */
+        TypeInfo *ti = (TypeInfo*)calloc(1, sizeof(TypeInfo));
+        if (!ti) error(ERR_FATAL, "Out of memory");
+        ti->kind = TYPE_FUNCPTR;
+        ti->fp_nparams = 0;
+        ti->fp_return  = TYPE_VOID;
+        parser_expect(parser, TOK_LPAREN);
+        if (!parser_match(parser, TOK_RPAREN)) {
+            TypeInfo *_pi = NULL;
+            ti->fp_params[ti->fp_nparams++] = parse_type(parser, &_pi);
+            if (_pi) free(_pi);
+            while (parser_match(parser, TOK_COMMA)) {
+                parser_advance(parser);
+                if (ti->fp_nparams < 8) {
+                    _pi = NULL;
+                    ti->fp_params[ti->fp_nparams++] = parse_type(parser, &_pi);
+                    if (_pi) free(_pi);
+                }
+            }
+        }
+        parser_expect(parser, TOK_RPAREN);
+        if (parser_match(parser, TOK_ARROW)) {
+            parser_advance(parser);
+            TypeInfo *_ri = NULL;
+            ti->fp_return = parse_type(parser, &_ri);
+            if (_ri) free(_ri);
+        }
+        if (out_info) *out_info = ti;
+        return TYPE_FUNCPTR;
     }
 
     /* Primitive (possibly optional) */
@@ -139,7 +285,7 @@ static ValueType parse_type(Parser *parser, TypeInfo **out_info) {
             case TYPE_F32:    return TYPE_OPT_F32;
             case TYPE_F64:    return TYPE_OPT_F64;
             default:
-                error_at(tok.line, tok.column,
+                error_at(ERR_SYNTAX, tok.line, tok.column,
                          "optional not supported for this type");
         }
     }
@@ -152,9 +298,22 @@ static ValueType parse_type(Parser *parser, TypeInfo **out_info) {
 
 ASTNode* ast_node_new(ASTNodeType t) {
     ASTNode *n = (ASTNode*)calloc(1, sizeof(ASTNode));
-    if (!n) error("Out of memory");
+    if (!n) error(ERR_FATAL, "Out of memory");
     n->type = t;
     return n;
+}
+
+void vl_strncpy(char *dst, const char *src, size_t size) {
+    if (!dst || size == 0) return;
+    if (!src) {
+        dst[0] = '\0';
+        return;
+    }
+    size_t i;
+    for (i = 0; i < size - 1 && src[i] != '\0'; i++) {
+        dst[i] = src[i];
+    }
+    dst[i] = '\0';
 }
 
 void ast_node_free(ASTNode *node) {
@@ -227,12 +386,19 @@ void ast_node_free(ASTNode *node) {
                 free(node->data.let.type_info);
             }
             break;
+        case AST_DEREF_ASSIGN:
+            ast_node_free(node->data.deref_assign.ptr_expr);
+            ast_node_free(node->data.deref_assign.value); break;
         case AST_ASSIGN:
             ast_node_free(node->data.assign.value); break;
         case AST_COMPOUND_ASSIGN:
             ast_node_free(node->data.compound_assign.value); break;
         case AST_FIELD_ASSIGN:
+            ast_node_free(node->data.field_assign.target);
             ast_node_free(node->data.field_assign.value); break;
+        case AST_FIELD_COMPOUND_ASSIGN:
+            ast_node_free(node->data.field_compound_assign.target);
+            ast_node_free(node->data.field_compound_assign.value); break;
         case AST_ARRAY_ASSIGN:
             ast_node_free(node->data.array_assign.index);
             ast_node_free(node->data.array_assign.index2);
@@ -270,6 +436,11 @@ void ast_node_free(ASTNode *node) {
             for (int i = 0; i < node->data.for_in_stmt.body_count; i++)
                 ast_node_free(node->data.for_in_stmt.body[i]);
             free(node->data.for_in_stmt.body);
+            break;
+        case AST_BLOCK:
+            for (int i = 0; i < node->data.block_stmt.count; i++)
+                ast_node_free(node->data.block_stmt.stmts[i]);
+            free(node->data.block_stmt.stmts);
             break;
         case AST_RANGE:
             ast_node_free(node->data.range.start);
@@ -336,6 +507,9 @@ void ast_node_free(ASTNode *node) {
             ast_node_free(node->data.throw_stmt.value); break;
         case AST_APPEND:
             ast_node_free(node->data.append_stmt.value); break;
+        case AST_CAST:
+            ast_node_free(node->data.cast.expr); break;
+        case AST_CONST_DECL: break; /* no child nodes */
         default: break;
     }
     free(node);
@@ -349,6 +523,16 @@ void parser_init(Parser *p, Token *tokens, int count) {
     p->tokens = tokens;
     p->token_count = count;
     p->pos = 0;
+    g_enum_const_count = 0;
+}
+
+/* Like parser_init but does NOT reset g_enum_const_count, preserving
+ * constants pre-loaded via parser_preload_module_consts(). */
+void parser_init_no_reset(Parser *p, Token *tokens, int count) {
+    p->tokens = tokens;
+    p->token_count = count;
+    p->pos = 0;
+    /* intentionally NOT resetting g_enum_const_count */
 }
 
 Token parser_current(Parser *p) {
@@ -381,7 +565,7 @@ bool parser_match(Parser *p, VelTokenType t) {
 Token parser_expect(Parser *p, VelTokenType t) {
     Token cur = parser_current(p);
     if (cur.type != t)
-        error_at(cur.line, cur.column,
+        error_at(ERR_SYNTAX, cur.line, cur.column,
                  "expected '%s', got '%s' ('%s')",
                  token_type_name(t),
                  token_type_name(cur.type),
@@ -431,7 +615,7 @@ static ASTNode* parse_primary(Parser *p) {
         ASTNode *body = parse_expression(p);
         ASTNode *n = ast_node_new(AST_LAMBDA);
         n->line = cur.line; n->column = cur.column;
-        strncpy(n->data.lambda.param_name, pname.value, MAX_TOKEN_LEN-1);
+        vl_strncpy(n->data.lambda.param_name, pname.value, MAX_TOKEN_LEN);
         n->data.lambda.has_type = has_type;
         n->data.lambda.param_type = ptype;
         n->data.lambda.param_typeinfo = ptinfo;
@@ -555,18 +739,46 @@ static ASTNode* parse_primary(Parser *p) {
 
     /* Identifier, call, struct literal, module call */
     if (cur.type == TOK_IDENTIFIER) {
+        long long enum_val = 0;
+        if (enum_const_lookup(cur.value, &enum_val)) {
+            ASTNode *n = ast_node_new(AST_INTEGER);
+            n->line = cur.line; n->column = cur.column;
+            n->data.int_value = enum_val;
+            parser_advance(p);
+            return n;
+        }
         char name[MAX_TOKEN_LEN];
-        strncpy(name, cur.value, MAX_TOKEN_LEN-1);
+        vl_strncpy(name, cur.value, MAX_TOKEN_LEN);
         int iline = cur.line, icol = cur.column;
         parser_advance(p);
         ASTNode *node = NULL;
+
+        /* Allow struct literal syntax with erased generic args: Point<adad> { ... } */
+        if (parser_match(p, TOK_LT)) {
+            int save = p->pos;
+            int depth = 0;
+            bool ok = false;
+            while (!parser_match(p, TOK_EOF)) {
+                Token t = parser_current(p);
+                if (t.type == TOK_LT) depth++;
+                else if (t.type == TOK_GT) {
+                    depth--;
+                    parser_advance(p);
+                    if (depth <= 0) { ok = true; break; }
+                    continue;
+                }
+                parser_advance(p);
+            }
+            if (!ok || !parser_match(p, TOK_LBRACE))
+                p->pos = save; /* keep '<' as normal operator in expressions */
+        }
 
         /* Struct literal: Name { field: val, ... } */
         if (allow_struct_literals && parser_match(p, TOK_LBRACE)) {
             parser_advance(p);
             ASTNode *n = ast_node_new(AST_STRUCT_LITERAL);
             n->line = iline; n->column = icol;
-            strncpy(n->data.struct_lit.struct_name, name, MAX_TOKEN_LEN-1);
+            vl_strncpy(n->data.struct_lit.struct_name, name, MAX_TOKEN_LEN);
             n->data.struct_lit.field_names  = (char**)malloc(sizeof(char*)*64);
             n->data.struct_lit.field_values = (ASTNode**)malloc(sizeof(ASTNode*)*64);
             n->data.struct_lit.field_count  = 0;
@@ -597,8 +809,8 @@ static ASTNode* parse_primary(Parser *p) {
                 parser_expect(p, TOK_LPAREN);
                 ASTNode *n = ast_node_new(AST_MODULE_CALL);
                 n->line = iline; n->column = icol;
-                strncpy(n->data.module_call.module_name, name, MAX_TOKEN_LEN-1);
-                strncpy(n->data.module_call.func_name, func_tok.value, MAX_TOKEN_LEN-1);
+                vl_strncpy(n->data.module_call.module_name, name, MAX_TOKEN_LEN);
+                vl_strncpy(n->data.module_call.func_name, func_tok.value, MAX_TOKEN_LEN);
                 n->data.module_call.args = (ASTNode**)malloc(sizeof(ASTNode*)*32);
                 n->data.module_call.arg_count =
                     parse_arg_list(p, n->data.module_call.args, 32);
@@ -611,7 +823,7 @@ static ASTNode* parse_primary(Parser *p) {
             parser_advance(p);
             ASTNode *n = ast_node_new(AST_CALL);
             n->line = iline; n->column = icol;
-            strncpy(n->data.call.func_name, name, MAX_TOKEN_LEN-1);
+            vl_strncpy(n->data.call.func_name, name, MAX_TOKEN_LEN);
             n->data.call.args = (ASTNode**)malloc(sizeof(ASTNode*)*32);
             n->data.call.arg_count = parse_arg_list(p, n->data.call.args, 32);
             node = n;
@@ -620,7 +832,7 @@ static ASTNode* parse_primary(Parser *p) {
         if (!node) {
             node = ast_node_new(AST_IDENTIFIER);
             node->line = iline; node->column = icol;
-            strncpy(node->data.identifier, name, MAX_TOKEN_LEN-1);
+            vl_strncpy(node->data.identifier, name, MAX_TOKEN_LEN);
         }
 
         /* Postfix: array access [], field access . or tuple .N */
@@ -665,10 +877,10 @@ static ASTNode* parse_primary(Parser *p) {
                         parser_expect(p, TOK_LPAREN);
                         if (node->type == AST_IDENTIFIER) {
                             ASTNode *n = ast_node_new(AST_MODULE_CALL);
-                            strncpy(n->data.module_call.module_name,
-                                    node->data.identifier, MAX_TOKEN_LEN-1);
-                            strncpy(n->data.module_call.func_name,
-                                    meth.value, MAX_TOKEN_LEN-1);
+                            vl_strncpy(n->data.module_call.module_name,
+                                    node->data.identifier, MAX_TOKEN_LEN);
+                            vl_strncpy(n->data.module_call.func_name,
+                                    meth.value, MAX_TOKEN_LEN);
                             n->data.module_call.args = (ASTNode**)malloc(sizeof(ASTNode*)*32);
                             n->data.module_call.arg_count =
                                 parse_arg_list(p, n->data.module_call.args, 32);
@@ -677,7 +889,7 @@ static ASTNode* parse_primary(Parser *p) {
                         } else {
                             /* complex base - treat as function call with base as first arg */
                             ASTNode *n = ast_node_new(AST_CALL);
-                            strncpy(n->data.call.func_name, meth.value, MAX_TOKEN_LEN-1);
+                            vl_strncpy(n->data.call.func_name, meth.value, MAX_TOKEN_LEN);
                             n->data.call.args = (ASTNode**)malloc(sizeof(ASTNode*)*33);
                             n->data.call.args[0] = node;
                             n->data.call.arg_count = 1;
@@ -695,9 +907,21 @@ static ASTNode* parse_primary(Parser *p) {
                     }
                     parser_advance(p);
                     Token field_tok = parser_expect(p, TOK_IDENTIFIER);
+                    
+                    /* Try resolving as enum member if base is an identifier (e.g. EnumName.Member) */
+                    long long eval = 0;
+                    if (node->type == AST_IDENTIFIER && enum_const_lookup(field_tok.value, &eval)) {
+                        ast_node_free(node);
+                        ASTNode *en = ast_node_new(AST_INTEGER);
+                        en->line = field_tok.line; en->column = field_tok.column;
+                        en->data.int_value = eval;
+                        node = en;
+                        continue;
+                    }
+
                     ASTNode *acc = ast_node_new(AST_FIELD_ACCESS);
                     acc->data.field_access.base = node;
-                    strncpy(acc->data.field_access.field_name, field_tok.value, MAX_TOKEN_LEN-1);
+                    vl_strncpy(acc->data.field_access.field_name, field_tok.value, MAX_TOKEN_LEN);
                     node = acc;
                     continue;
                 }
@@ -707,7 +931,7 @@ static ASTNode* parse_primary(Parser *p) {
         return node;
     }
 
-    error_at(cur.line, cur.column,
+    error_at(ERR_SYNTAX, cur.line, cur.column,
              "unexpected token '%s' ('%s') in expression",
              token_type_name(cur.type), cur.value);
     return NULL;
@@ -745,17 +969,54 @@ static ASTNode* parse_unary(Parser *p) {
         n->data.unary.operand = operand;
         return n;
     }
+    if (cur.type == TOK_AMP) {
+        parser_advance(p);
+        ASTNode *operand = parse_unary(p);
+        ASTNode *n = ast_node_new(AST_UNARY_OP);
+        n->line = cur.line; n->column = cur.column;
+        n->data.unary.op = UOP_ADDR;
+        n->data.unary.operand = operand;
+        return n;
+    }
+    if (cur.type == TOK_STAR) {
+        parser_advance(p);
+        ASTNode *operand = parse_unary(p);
+        ASTNode *n = ast_node_new(AST_UNARY_OP);
+        n->line = cur.line; n->column = cur.column;
+        n->data.unary.op = UOP_DEREF;
+        n->data.unary.operand = operand;
+        return n;
+    }
     return parse_primary(p);
 }
 
 /* Multiplicative: * / % */
-static ASTNode* parse_multiplicative(Parser *p) {
+/* -- parse_cast: expr as TypeKeyword ----------------------------- */
+static ASTNode* parse_cast(Parser *p) {
     ASTNode *left = parse_unary(p);
+    while (parser_match(p, TOK_AS)) {
+        Token as_tok = parser_current(p);
+        parser_advance(p);
+        TypeInfo *dummy = NULL;
+        ValueType target = parse_type(p, &dummy);
+        if (dummy) free(dummy);
+        ASTNode *n = ast_node_new(AST_CAST);
+        n->line   = as_tok.line;
+        n->column = as_tok.column;
+        n->data.cast.expr        = left;
+        n->data.cast.target_type = target;
+        left = n;
+    }
+    return left;
+}
+
+static ASTNode* parse_multiplicative(Parser *p) {
+    ASTNode *left = parse_cast(p);
     while (parser_match(p, TOK_STAR) ||
            parser_match(p, TOK_SLASH) ||
            parser_match(p, TOK_PERCENT)) {
         Token op = parser_current(p); parser_advance(p);
-        ASTNode *right = parse_unary(p);
+        ASTNode *right = parse_cast(p);
         ASTNode *n = ast_node_new(AST_BINARY_OP);
         n->data.binary.op = (op.type == TOK_STAR)    ? OP_MUL :
                             (op.type == TOK_SLASH)   ? OP_DIV : OP_MOD;
@@ -897,8 +1158,23 @@ static ASTNode* parse_logor(Parser *p) {
     return left;
 }
 
+/* Null coalescing: ?? (lower precedence than ||) */
+static ASTNode* parse_coalesce(Parser *p) {
+    ASTNode *left = parse_logor(p);
+    while (parser_match(p, TOK_DQUESTION)) {
+        parser_advance(p);
+        ASTNode *right = parse_logor(p);
+        ASTNode *n = ast_node_new(AST_BINARY_OP);
+        n->data.binary.op = OP_COALESCE;
+        n->data.binary.left  = left;
+        n->data.binary.right = right;
+        left = n;
+    }
+    return left;
+}
+
 ASTNode* parse_expression(Parser *p) {
-    return parse_logor(p);
+    return parse_coalesce(p);
 }
 
 static ASTNode* parse_expression_with_struct(Parser *p, bool allow) {
@@ -930,7 +1206,7 @@ static ASTNode* parse_for_header_stmt(Parser *p) {
         parser_expect(p, TOK_ASSIGN);
         ASTNode *val = parse_expression(p);
         ASTNode *n = ast_node_new(AST_LET);
-        strncpy(n->data.let.var_name, name.value, MAX_TOKEN_LEN-1);
+        vl_strncpy(n->data.let.var_name, name.value, MAX_TOKEN_LEN);
         n->data.let.value = val; n->data.let.has_type = has_type;
         n->data.let.var_type = vtype; n->data.let.is_mut = is_mut;
         n->data.let.type_info = tinfo;
@@ -951,7 +1227,7 @@ static ASTNode* parse_for_header_stmt(Parser *p) {
                 parser_advance(p);
                 ASTNode *val = parse_expression(p);
                 ASTNode *n = ast_node_new(AST_ARRAY_ASSIGN);
-                strncpy(n->data.array_assign.var_name, name.value, MAX_TOKEN_LEN-1);
+                vl_strncpy(n->data.array_assign.var_name, name.value, MAX_TOKEN_LEN);
                 n->data.array_assign.index = idx;
                 n->data.array_assign.value = val;
                 return n;
@@ -973,7 +1249,7 @@ static ASTNode* parse_for_header_stmt(Parser *p) {
             Token op = parser_current(p); parser_advance(p);
             ASTNode *val = parse_expression(p);
             ASTNode *n = ast_node_new(AST_COMPOUND_ASSIGN);
-            strncpy(n->data.compound_assign.var_name, name.value, MAX_TOKEN_LEN-1);
+            vl_strncpy(n->data.compound_assign.var_name, name.value, MAX_TOKEN_LEN);
             n->data.compound_assign.value = val;
             n->data.compound_assign.op =
                 (op.type == TOK_PLUS_ASSIGN)    ? OP_ADD :
@@ -992,7 +1268,7 @@ static ASTNode* parse_for_header_stmt(Parser *p) {
             parser_advance(p);
             ASTNode *val = parse_expression(p);
             ASTNode *n = ast_node_new(AST_ASSIGN);
-            strncpy(n->data.assign.var_name, name.value, MAX_TOKEN_LEN-1);
+            vl_strncpy(n->data.assign.var_name, name.value, MAX_TOKEN_LEN);
             n->data.assign.value = val;
             return n;
         }
@@ -1051,6 +1327,18 @@ static ASTNode** parse_block(Parser *p, int *count_out) {
 ASTNode* parse_statement(Parser *p) {
     Token cur = parser_current(p);
 
+    /* bare { } scoped block */
+    if (cur.type == TOK_LBRACE) {
+        parser_advance(p);
+        int count;
+        ASTNode **stmts = parse_block(p, &count);
+        ASTNode *n = ast_node_new(AST_BLOCK);
+        n->line = cur.line; n->column = cur.column;
+        n->data.block_stmt.stmts = stmts;
+        n->data.block_stmt.count = count;
+        return n;
+    }
+
     /* chu -- return */
     if (cur.type == TOK_CHU) {
         parser_advance(p);
@@ -1062,11 +1350,45 @@ ASTNode* parse_statement(Parser *p) {
         return n;
     }
 
+    /* saabit -- compile-time constant (stored in enum table) */
+    if (cur.type == TOK_SAABIT) {
+        parser_advance(p);
+        Token name = parser_expect(p, TOK_IDENTIFIER);
+        parser_expect(p, TOK_ASSIGN);
+        /* Reuse the existing enum literal parser for consistency */
+        long long val = parse_enum_int_literal(p);
+        enum_const_add(name, val);
+        parser_expect(p, TOK_SEMICOLON);
+        /* Emit a harmless AST_CONST_DECL node (no codegen needed) */
+        ASTNode *n = ast_node_new(AST_CONST_DECL);
+        n->line = cur.line; n->column = cur.column;
+        vl_strncpy(n->data.const_decl.name, name.value, MAX_TOKEN_LEN);
+        n->data.const_decl.value = val;
+        return n;
+    }
+
+    /* *ptr = val;  — write through pointer */
+    if (cur.type == TOK_STAR) {
+        parser_advance(p);
+        ASTNode *ptr_e = parse_unary(p);
+        parser_expect(p, TOK_ASSIGN);
+        ASTNode *val_e = parse_expression(p);
+        parser_expect(p, TOK_SEMICOLON);
+        ASTNode *n = ast_node_new(AST_DEREF_ASSIGN);
+        n->line = cur.line; n->column = cur.column;
+        n->data.deref_assign.ptr_expr = ptr_e;
+        n->data.deref_assign.value    = val_e;
+        return n;
+    }
+
     /* ath -- let declaration */
     if (cur.type == TOK_ATH) {
         parser_advance(p);
         bool is_mut = false;
         if (parser_match(p, TOK_MUT)) { is_mut = true; parser_advance(p); }
+        /* ath *name = &x;  →  pointer variable (sugar) */
+        bool is_ptr_decl = false;
+        if (parser_match(p, TOK_STAR)) { is_ptr_decl = true; parser_advance(p); }
         Token name = parser_expect(p, TOK_IDENTIFIER);
         bool has_type = false; ValueType vtype = TYPE_INT;
         TypeInfo *tinfo = NULL;
@@ -1075,12 +1397,13 @@ ASTNode* parse_statement(Parser *p) {
             vtype = parse_type(p, &tinfo);
             has_type = true;
         }
+        if (is_ptr_decl && !has_type) { vtype = TYPE_PTR; has_type = true; }
         parser_expect(p, TOK_ASSIGN);
         ASTNode *val = parse_expression(p);
         parser_expect(p, TOK_SEMICOLON);
         ASTNode *n = ast_node_new(AST_LET);
         n->line = cur.line; n->column = cur.column;
-        strncpy(n->data.let.var_name, name.value, MAX_TOKEN_LEN-1);
+        vl_strncpy(n->data.let.var_name, name.value, MAX_TOKEN_LEN);
         n->data.let.value    = val;
         n->data.let.has_type = has_type;
         n->data.let.var_type = vtype;
@@ -1183,7 +1506,7 @@ ASTNode* parse_statement(Parser *p) {
         ASTNode **body = parse_block(p, &body_c);
         ASTNode *n = ast_node_new(AST_FOR_IN);
         n->line = cur.line; n->column = cur.column;
-        strncpy(n->data.for_in_stmt.var_name, vname.value, MAX_TOKEN_LEN-1);
+        vl_strncpy(n->data.for_in_stmt.var_name, vname.value, MAX_TOKEN_LEN);
         n->data.for_in_stmt.is_mut   = is_mut;
         n->data.for_in_stmt.has_type = has_type;
         n->data.for_in_stmt.var_type = vtype;
@@ -1251,7 +1574,7 @@ ASTNode* parse_statement(Parser *p) {
         n->line = cur.line; n->column = cur.column;
         n->data.try_catch.try_body    = try_body;
         n->data.try_catch.try_count   = try_c;
-        strncpy(n->data.try_catch.catch_var, evar.value, MAX_TOKEN_LEN-1);
+        vl_strncpy(n->data.try_catch.catch_var, evar.value, MAX_TOKEN_LEN);
         n->data.try_catch.catch_body  = catch_body;
         n->data.try_catch.catch_count = catch_c;
         return n;
@@ -1292,9 +1615,43 @@ ASTNode* parse_statement(Parser *p) {
                 parser_expect(p, TOK_SEMICOLON);
                 ASTNode *n = ast_node_new(AST_APPEND);
                 n->line = cur.line; n->column = cur.column;
-                strncpy(n->data.append_stmt.arr_name, name.value, MAX_TOKEN_LEN-1);
+                vl_strncpy(n->data.append_stmt.arr_name, name.value, MAX_TOKEN_LEN);
+                n->data.append_stmt.field_chain[0] = '\0';
                 n->data.append_stmt.value = val;
                 return n;
+            }
+            /* struct.field(.field... ).append(val); */
+            if (next.type == TOK_IDENTIFIER) {
+                int saved2 = p->pos;
+                /* consume '.' then parse field chain until we see ".append(" */
+                parser_advance(p); /* consume '.' */
+                char chain[MAX_TOKEN_LEN] = "";
+                while (1) {
+                    Token ftok = parser_expect(p, TOK_IDENTIFIER);
+                    if (chain[0]) strncat(chain, ".", MAX_TOKEN_LEN - strlen(chain) - 1);
+                    strncat(chain, ftok.value, MAX_TOKEN_LEN - strlen(chain) - 1);
+                    if (!parser_match(p, TOK_DOT)) break;
+                    Token n1 = parser_peek(p, 1);
+                    if (n1.type == TOK_APPEND ||
+                        (n1.type == TOK_IDENTIFIER && strcmp(n1.value, "append") == 0)) {
+                        parser_advance(p); /* consume '.' */
+                        parser_advance(p); /* consume 'append' */
+                        parser_expect(p, TOK_LPAREN);
+                        ASTNode *val = parse_expression(p);
+                        parser_expect(p, TOK_RPAREN);
+                        parser_expect(p, TOK_SEMICOLON);
+                        ASTNode *n = ast_node_new(AST_APPEND);
+                        n->line = cur.line; n->column = cur.column;
+                        vl_strncpy(n->data.append_stmt.arr_name, name.value, MAX_TOKEN_LEN);
+                        vl_strncpy(n->data.append_stmt.field_chain, chain, MAX_TOKEN_LEN);
+                        n->data.append_stmt.value = val;
+                        return n;
+                    }
+                    /* continue consuming ".<ident>" */
+                    parser_advance(p); /* consume '.' */
+                }
+                /* not an append call - rewind and let other statement forms handle it */
+                p->pos = saved2;
             }
             /* Chained field assignment: name.f0.f1...fN = val */
             if (next.type == TOK_IDENTIFIER) {
@@ -1302,14 +1659,14 @@ ASTNode* parse_statement(Parser *p) {
                 int  field_count = 0;
                 parser_advance(p); /* consume '.' */
                 Token ftok = parser_expect(p, TOK_IDENTIFIER);
-                strncpy(fields[field_count++], ftok.value, MAX_TOKEN_LEN-1);
+                vl_strncpy(fields[field_count++], ftok.value, MAX_TOKEN_LEN);
                 while (parser_match(p, TOK_DOT)) {
                     Token np2 = parser_peek(p, 1);
                     if (np2.type != TOK_IDENTIFIER) break;
                     parser_advance(p);
                     Token ft2 = parser_expect(p, TOK_IDENTIFIER);
                     if (field_count < 16)
-                        strncpy(fields[field_count++], ft2.value, MAX_TOKEN_LEN-1);
+                        vl_strncpy(fields[field_count++], ft2.value, MAX_TOKEN_LEN);
                 }
                 if (parser_match(p, TOK_ASSIGN)) {
                     parser_advance(p);
@@ -1317,14 +1674,49 @@ ASTNode* parse_statement(Parser *p) {
                     parser_expect(p, TOK_SEMICOLON);
                     ASTNode *n = ast_node_new(AST_FIELD_ASSIGN);
                     n->line = cur.line; n->column = cur.column;
-                    strncpy(n->data.field_assign.var_name, name.value, MAX_TOKEN_LEN-1);
+                    vl_strncpy(n->data.field_assign.var_name, name.value, MAX_TOKEN_LEN);
                     char chain[MAX_TOKEN_LEN] = "";
                     for (int fi = 0; fi < field_count; fi++) {
                         if (fi > 0) strncat(chain, ".", MAX_TOKEN_LEN-strlen(chain)-1);
                         strncat(chain, fields[fi], MAX_TOKEN_LEN-strlen(chain)-1);
                     }
-                    strncpy(n->data.field_assign.field_name, chain, MAX_TOKEN_LEN-1);
+                    vl_strncpy(n->data.field_assign.field_name, chain, MAX_TOKEN_LEN);
                     n->data.field_assign.value = val;
+                    return n;
+                }
+                if (parser_match(p, TOK_PLUS_ASSIGN)    ||
+                    parser_match(p, TOK_MINUS_ASSIGN)   ||
+                    parser_match(p, TOK_STAR_ASSIGN)    ||
+                    parser_match(p, TOK_SLASH_ASSIGN)   ||
+                    parser_match(p, TOK_PERCENT_ASSIGN) ||
+                    parser_match(p, TOK_AMP_ASSIGN)     ||
+                    parser_match(p, TOK_PIPE_ASSIGN)    ||
+                    parser_match(p, TOK_CARET_ASSIGN)   ||
+                    parser_match(p, TOK_SHL_ASSIGN)     ||
+                    parser_match(p, TOK_SHR_ASSIGN)) {
+                    Token op = parser_current(p); parser_advance(p);
+                    ASTNode *val = parse_expression(p);
+                    parser_expect(p, TOK_SEMICOLON);
+                    ASTNode *n = ast_node_new(AST_FIELD_COMPOUND_ASSIGN);
+                    n->line = cur.line; n->column = cur.column;
+                    vl_strncpy(n->data.field_compound_assign.var_name, name.value, MAX_TOKEN_LEN);
+                    char chain[MAX_TOKEN_LEN] = "";
+                    for (int fi = 0; fi < field_count; fi++) {
+                        if (fi > 0) strncat(chain, ".", MAX_TOKEN_LEN-strlen(chain)-1);
+                        strncat(chain, fields[fi], MAX_TOKEN_LEN-strlen(chain)-1);
+                    }
+                    vl_strncpy(n->data.field_compound_assign.field_name, chain, MAX_TOKEN_LEN);
+                    n->data.field_compound_assign.value = val;
+                    n->data.field_compound_assign.op =
+                        (op.type == TOK_PLUS_ASSIGN)    ? OP_ADD :
+                        (op.type == TOK_MINUS_ASSIGN)   ? OP_SUB :
+                        (op.type == TOK_STAR_ASSIGN)    ? OP_MUL :
+                        (op.type == TOK_SLASH_ASSIGN)   ? OP_DIV :
+                        (op.type == TOK_PERCENT_ASSIGN) ? OP_MOD :
+                        (op.type == TOK_AMP_ASSIGN)     ? OP_BAND :
+                        (op.type == TOK_PIPE_ASSIGN)    ? OP_BOR :
+                        (op.type == TOK_CARET_ASSIGN)   ? OP_BXOR :
+                        (op.type == TOK_SHL_ASSIGN)     ? OP_SHL : OP_SHR;
                     return n;
                 }
                 p->pos = saved;
@@ -1349,7 +1741,7 @@ ASTNode* parse_statement(Parser *p) {
                 parser_expect(p, TOK_SEMICOLON);
                 ASTNode *n = ast_node_new(AST_ARRAY_ASSIGN);
                 n->line = cur.line; n->column = cur.column;
-                strncpy(n->data.array_assign.var_name, name.value, MAX_TOKEN_LEN-1);
+                vl_strncpy(n->data.array_assign.var_name, name.value, MAX_TOKEN_LEN);
                 n->data.array_assign.index  = idx;
                 n->data.array_assign.index2 = idx2;
                 n->data.array_assign.value  = val;
@@ -1374,7 +1766,7 @@ ASTNode* parse_statement(Parser *p) {
             parser_expect(p, TOK_SEMICOLON);
             ASTNode *n = ast_node_new(AST_COMPOUND_ASSIGN);
             n->line = cur.line; n->column = cur.column;
-            strncpy(n->data.compound_assign.var_name, name.value, MAX_TOKEN_LEN-1);
+            vl_strncpy(n->data.compound_assign.var_name, name.value, MAX_TOKEN_LEN);
             n->data.compound_assign.value = val;
             n->data.compound_assign.op =
                 (op.type == TOK_PLUS_ASSIGN)    ? OP_ADD :
@@ -1396,7 +1788,7 @@ ASTNode* parse_statement(Parser *p) {
             parser_expect(p, TOK_SEMICOLON);
             ASTNode *n = ast_node_new(AST_ASSIGN);
             n->line = cur.line; n->column = cur.column;
-            strncpy(n->data.assign.var_name, name.value, MAX_TOKEN_LEN-1);
+            vl_strncpy(n->data.assign.var_name, name.value, MAX_TOKEN_LEN);
             n->data.assign.value = val;
             return n;
         }
@@ -1405,13 +1797,11 @@ ASTNode* parse_statement(Parser *p) {
         p->pos = saved;
     }
 
-    /* Expression statement (also reached via goto expr_stmt for chained assignment) */
-    expr_stmt: ;
+    /* Expression statement (also reached for chained assignment) */
     {
         /* Check for chained assignment: expr = val where lhs is a field chain.
            We parse the full expression first, then look for '='.
            This handles: p.pos.x = 10.0; table[i].key = 5; etc. */
-        int saved2 = p->pos;
         ASTNode *lhs = parse_expression(p);
 
         if (parser_match(p, TOK_ASSIGN)) {
@@ -1421,74 +1811,53 @@ ASTNode* parse_statement(Parser *p) {
             parser_expect(p, TOK_SEMICOLON);
 
             if (lhs->type == AST_FIELD_ACCESS) {
-                /* Nested field assign: build a chain */
-                /* Flatten: find the root identifier and field chain */
-                ASTNode *base = lhs->data.field_access.base;
-                char field[MAX_TOKEN_LEN];
-                strncpy(field, lhs->data.field_access.field_name, MAX_TOKEN_LEN-1);
-
-                if (base->type == AST_IDENTIFIER) {
-                    /* Simple: var.field = val */
-                    ASTNode *n = ast_node_new(AST_FIELD_ASSIGN);
-                    n->line = lhs->line; n->column = lhs->column;
-                    strncpy(n->data.field_assign.var_name,
-                            base->data.identifier, MAX_TOKEN_LEN-1);
-                    strncpy(n->data.field_assign.field_name, field, MAX_TOKEN_LEN-1);
-                    n->data.field_assign.value = rhs;
-                    ast_node_free(lhs);
-                    return n;
-                }
-                /* Deep chain: p.pos.x = val
-                   Emit as expression-level assignment (codegen handles field access lvalue).
-                   Encode as FIELD_ASSIGN with var_name="<chain>" -- codegen will see
-                   field_name and reconstruct. For now we re-parse from saved position
-                   using a field assign approach via the AST we already have. */
-                /* Repack: lhs is AST_FIELD_ACCESS tree, rhs is value.
-                   We create a special wrapper -- store lhs in value, rhs in a known field.
-                   Simplest: emit as an expression statement that codegen evaluates.
-                   But we need to store to lhs address. Use existing codegen infrastructure:
-                   emit lhs address + rhs value via a synthesized FIELD_ASSIGN. */
                 ASTNode *n = ast_node_new(AST_FIELD_ASSIGN);
                 n->line = lhs->line; n->column = lhs->column;
-                /* For deep chains, we'll use var_name="__chain__" as a sentinel
-                   and reuse the field_assign base differently. Since our struct
-                   only has var_name+field_name, handle in codegen by falling through
-                   to expression statement path (codegen can't easily handle this without
-                   lvalue expressions). For now: linearize with a temp assign approach. */
-                /* WORKAROUND: parse as expression (side-effect: does nothing useful for assignment)
-                   The cleanest fix is to add lvalue support to codegen. For now, fall back
-                   to the original expression-statement which at least won't crash. */
-                ast_node_free(n);
-                /* Emit a synthetic assignment: codegen will evaluate lhs for address, rhs for value */
-                /* Since we can't easily store the lhs AST in field_assign, use AST_ARRAY_ASSIGN
-                   trick isn't clean either. Best: just warn and skip for deep chains. */
-                p->pos = saved2;
-                ast_node_free(rhs);
-                /* Re-parse as plain expression statement */
-                ASTNode *expr2 = parse_expression(p);
-                parser_expect(p, TOK_SEMICOLON);
-                return expr2;
+                n->data.field_assign.target = lhs;
+                vl_strncpy(n->data.field_assign.field_name,
+                        lhs->data.field_access.field_name, MAX_TOKEN_LEN);
+                if (lhs->data.field_access.base &&
+                    lhs->data.field_access.base->type == AST_IDENTIFIER) {
+                    vl_strncpy(n->data.field_assign.var_name,
+                            lhs->data.field_access.base->data.identifier,
+                            MAX_TOKEN_LEN);
+                }
+                n->data.field_assign.value = rhs;
+                return n;
             }
             else if (lhs->type == AST_ARRAY_ACCESS) {
-                /* arr[i] = val or arr[i].field = val was caught above */
+                /* arr[i] = val.
+                   If the base is a plain identifier, keep the fast AST_ARRAY_ASSIGN.
+                   Otherwise (e.g. self.data[i] = val), lower to *(&lhs) = rhs. */
                 ASTNode *arr_base = lhs->data.array_access.array;
-                ASTNode *n = ast_node_new(AST_ARRAY_ASSIGN);
-                n->line = lhs->line; n->column = lhs->column;
-                if (arr_base->type == AST_IDENTIFIER)
-                    strncpy(n->data.array_assign.var_name,
-                            arr_base->data.identifier, MAX_TOKEN_LEN-1);
-                n->data.array_assign.index  = lhs->data.array_access.index;
-                n->data.array_assign.index2 = lhs->data.array_access.index2;
-                n->data.array_assign.value  = rhs;
-                lhs->data.array_access.index  = NULL;
-                lhs->data.array_access.index2 = NULL;
-                ast_node_free(lhs);
-                return n;
+                if (arr_base->type == AST_IDENTIFIER) {
+                    ASTNode *n = ast_node_new(AST_ARRAY_ASSIGN);
+                    n->line = lhs->line; n->column = lhs->column;
+                    vl_strncpy(n->data.array_assign.var_name,
+                               arr_base->data.identifier, MAX_TOKEN_LEN);
+                    n->data.array_assign.index  = lhs->data.array_access.index;
+                    n->data.array_assign.index2 = lhs->data.array_access.index2;
+                    n->data.array_assign.value  = rhs;
+                    lhs->data.array_access.index  = NULL;
+                    lhs->data.array_access.index2 = NULL;
+                    ast_node_free(lhs);
+                    return n;
+                } else {
+                    ASTNode *addr = ast_node_new(AST_UNARY_OP);
+                    addr->line = lhs->line; addr->column = lhs->column;
+                    addr->data.unary.op = UOP_ADDR;
+                    addr->data.unary.operand = lhs; /* take address of full lvalue */
+                    ASTNode *n = ast_node_new(AST_DEREF_ASSIGN);
+                    n->line = lhs->line; n->column = lhs->column;
+                    n->data.deref_assign.ptr_expr = addr;
+                    n->data.deref_assign.value = rhs;
+                    return n;
+                }
             }
             else if (lhs->type == AST_IDENTIFIER) {
                 ASTNode *n = ast_node_new(AST_ASSIGN);
                 n->line = lhs->line; n->column = lhs->column;
-                strncpy(n->data.assign.var_name, lhs->data.identifier, MAX_TOKEN_LEN-1);
+                vl_strncpy(n->data.assign.var_name, lhs->data.identifier, MAX_TOKEN_LEN);
                 n->data.assign.value = rhs;
                 ast_node_free(lhs);
                 return n;
@@ -1511,15 +1880,50 @@ ASTNode* parse_statement(Parser *p) {
 static ASTNode* parse_import(Parser *p) {
     parser_expect(p, TOK_ANAW);
     Token mod = parser_expect(p, TOK_IDENTIFIER);
-    parser_expect(p, TOK_SEMICOLON);
     ASTNode *n = ast_node_new(AST_IMPORT);
-    strncpy(n->data.import.module_name, mod.value, MAX_TOKEN_LEN-1);
+    vl_strncpy(n->data.import.module_name, mod.value, MAX_TOKEN_LEN);
+    n->data.import.func_name[0] = '\0';
+    n->data.import.is_selective  = false;
+    n->data.import.func_name_count = 0;
+    /* anaw mod::func;  or  anaw mod::*;  or  anaw mod::{a,b,c}; */
+    if (parser_match(p, TOK_DCOLON)) {
+        parser_advance(p); /* consume :: */
+        if (parser_match(p, TOK_STAR)) {
+            parser_advance(p); /* anaw mod::*; — import all, explicit */
+        } else if (parser_match(p, TOK_LBRACE)) {
+            /* anaw mod::{func1, func2, ...}; — multi-item selective import */
+            parser_advance(p); /* consume { */
+            n->data.import.is_selective = true;
+            int nc = 0;
+            while (!parser_match(p, TOK_RBRACE) && !parser_match(p, TOK_EOF)) {
+                Token fn = parser_expect(p, TOK_IDENTIFIER);
+                if (nc < 8) {
+                    vl_strncpy(n->data.import.func_names[nc], fn.value, MAX_TOKEN_LEN);
+                    nc++;
+                }
+                if (parser_match(p, TOK_COMMA)) parser_advance(p);
+            }
+            parser_expect(p, TOK_RBRACE);
+            n->data.import.func_name_count = nc;
+            /* copy first name into func_name for backwards compat */
+            if (nc > 0)
+                vl_strncpy(n->data.import.func_name, n->data.import.func_names[0], MAX_TOKEN_LEN);
+        } else {
+            Token fn = parser_expect(p, TOK_IDENTIFIER);
+            vl_strncpy(n->data.import.func_name, fn.value, MAX_TOKEN_LEN);
+            n->data.import.func_name_count = 1;
+            vl_strncpy(n->data.import.func_names[0], fn.value, MAX_TOKEN_LEN);
+            n->data.import.is_selective = true;
+        }
+    }
+    parser_expect(p, TOK_SEMICOLON);
     return n;
 }
 
-static ASTNode* parse_struct(Parser *p) {
-    Token bina_tok = parser_current(p);
-    parser_expect(p, TOK_BINA);
+static ASTNode* parse_struct(Parser *p, bool is_union) {
+    Token kw_tok = parser_current(p);
+    if (is_union) parser_expect(p, TOK_UNION);
+    else parser_expect(p, TOK_BINA);
     Token name = parser_expect(p, TOK_IDENTIFIER);
 
     /* Generic type params: bina Point<T> { ... } */
@@ -1530,7 +1934,7 @@ static ASTNode* parse_struct(Parser *p) {
         while (!parser_match(p, TOK_GT) && !parser_match(p, TOK_EOF)) {
             Token tp = parser_expect(p, TOK_IDENTIFIER);
             if (generic_count < 8)
-                strncpy(generic_params[generic_count++], tp.value, MAX_TOKEN_LEN-1);
+                vl_strncpy(generic_params[generic_count++], tp.value, MAX_TOKEN_LEN);
             if (parser_match(p, TOK_COMMA)) parser_advance(p);
         }
         parser_expect(p, TOK_GT);
@@ -1558,7 +1962,7 @@ static ASTNode* parse_struct(Parser *p) {
                 parser_advance(p);
                 ftinfo = (TypeInfo*)calloc(1, sizeof(TypeInfo));
                 ftinfo->kind = TYPE_STRUCT;
-                strncpy(ftinfo->generic_name, ftpeak.value, MAX_TOKEN_LEN-1);
+                vl_strncpy(ftinfo->generic_name, ftpeak.value, MAX_TOKEN_LEN);
                 ftype = TYPE_STRUCT;
                 break;
             }
@@ -1574,16 +1978,39 @@ static ASTNode* parse_struct(Parser *p) {
     parser_expect(p, TOK_RBRACE);
 
     ASTNode *n = ast_node_new(AST_STRUCT_DEF);
-    n->line = bina_tok.line; n->column = bina_tok.column;
-    strncpy(n->data.struct_def.name, name.value, MAX_TOKEN_LEN-1);
+    n->line = kw_tok.line; n->column = kw_tok.column;
+    vl_strncpy(n->data.struct_def.name, name.value, MAX_TOKEN_LEN);
     n->data.struct_def.field_names    = field_names;
     n->data.struct_def.field_types    = field_types;
     n->data.struct_def.field_typeinfo = field_ti;
     n->data.struct_def.field_count    = field_count;
+    n->data.struct_def.is_union       = is_union;
     n->data.struct_def.generic_count  = generic_count;
     for (int gi = 0; gi < generic_count; gi++)
-        strncpy(n->data.struct_def.generic_params[gi], generic_params[gi], MAX_TOKEN_LEN-1);
+        vl_strncpy(n->data.struct_def.generic_params[gi], generic_params[gi], MAX_TOKEN_LEN);
     return n;
+}
+
+static void parse_enum(Parser *p) {
+    parser_expect(p, TOK_TADAD);
+    (void)parser_expect(p, TOK_IDENTIFIER); /* enum type name for readability */
+    parser_expect(p, TOK_LBRACE);
+
+    long long cur = -1;
+    while (!parser_match(p, TOK_RBRACE) && !parser_match(p, TOK_EOF)) {
+        Token m = parser_expect(p, TOK_IDENTIFIER);
+        if (parser_match(p, TOK_ASSIGN)) {
+            parser_advance(p);
+            cur = parse_enum_int_literal(p);
+        } else {
+            cur++;
+        }
+        enum_const_add(m, cur);
+        if (parser_match(p, TOK_COMMA) || parser_match(p, TOK_SEMICOLON))
+            parser_advance(p);
+    }
+    parser_expect(p, TOK_RBRACE);
+    if (parser_match(p, TOK_SEMICOLON)) parser_advance(p);
 }
 
 static ASTNode* parse_function(Parser *p) {
@@ -1599,7 +2026,7 @@ static ASTNode* parse_function(Parser *p) {
         while (!parser_match(p, TOK_GT) && !parser_match(p, TOK_EOF)) {
             Token tp = parser_expect(p, TOK_IDENTIFIER);
             if (generic_count < 8)
-                strncpy(generic_params[generic_count++], tp.value, MAX_TOKEN_LEN-1);
+                vl_strncpy(generic_params[generic_count++], tp.value, MAX_TOKEN_LEN);
             if (parser_match(p, TOK_COMMA)) parser_advance(p);
         }
         parser_expect(p, TOK_GT);
@@ -1622,7 +2049,23 @@ static ASTNode* parse_function(Parser *p) {
                 is_ref = true;
                 parser_advance(p);
             }
+            /* mut self — consume 'mut', then treat as bare 'self' */
+            if (parser_match(p, TOK_MUT)) {
+                Token peek = p->tokens[p->pos + 1];
+                if (peek.type == TOK_IDENTIFIER && strcmp(peek.value, "self") == 0) {
+                    parser_advance(p); /* consume 'mut' */
+                }
+            }
             Token pname = parser_expect(p, TOK_IDENTIFIER);
+            /* 'self' without type annotation: allowed inside amal methods */
+            if (strcmp(pname.value, "self") == 0 && !parser_match(p, TOK_COLON)) {
+                param_names[param_count] = strdup(pname.value);
+                param_types[param_count] = TYPE_VOID; /* placeholder; fixed by parse_amal */
+                param_ti[param_count]    = NULL;
+                param_is_ref[param_count]= false;
+                param_count++;
+                continue;
+            }
             parser_expect(p, TOK_COLON);
             TypeInfo *ptinfo = NULL;
             ValueType ptype = TYPE_INT;
@@ -1637,7 +2080,7 @@ static ASTNode* parse_function(Parser *p) {
                     parser_advance(p);
                     ptinfo = (TypeInfo*)calloc(1, sizeof(TypeInfo));
                     ptinfo->kind = TYPE_STRUCT; /* placeholder */
-                    strncpy(ptinfo->generic_name, tpeak.value, MAX_TOKEN_LEN-1);
+                    vl_strncpy(ptinfo->generic_name, tpeak.value, MAX_TOKEN_LEN);
                     ptype = TYPE_STRUCT;
                     break;
                 }
@@ -1672,7 +2115,7 @@ static ASTNode* parse_function(Parser *p) {
             parser_advance(p);
             rtinfo = (TypeInfo*)calloc(1, sizeof(TypeInfo));
             rtinfo->kind = TYPE_STRUCT;
-            strncpy(rtinfo->generic_name, retpeak.value, MAX_TOKEN_LEN-1);
+            vl_strncpy(rtinfo->generic_name, retpeak.value, MAX_TOKEN_LEN);
             ret_type = TYPE_STRUCT;
             break;
         }
@@ -1685,7 +2128,7 @@ static ASTNode* parse_function(Parser *p) {
 
     ASTNode *n = ast_node_new(AST_FUNCTION);
     n->line = kar_tok.line; n->column = kar_tok.column;
-    strncpy(n->data.function.name, name.value, MAX_TOKEN_LEN-1);
+    vl_strncpy(n->data.function.name, name.value, MAX_TOKEN_LEN);
     n->data.function.param_names    = param_names;
     n->data.function.param_types    = param_types;
     n->data.function.param_typeinfo = param_ti;
@@ -1698,8 +2141,55 @@ static ASTNode* parse_function(Parser *p) {
     n->data.function.is_exported    = true;
     n->data.function.generic_count  = generic_count;
     for (int gi = 0; gi < generic_count; gi++)
-        strncpy(n->data.function.generic_params[gi], generic_params[gi], MAX_TOKEN_LEN-1);
+        vl_strncpy(n->data.function.generic_params[gi], generic_params[gi], MAX_TOKEN_LEN);
     return n;
+}
+
+/* parse_amal: amal StructName { kar method(...) -> R { body } ... }
+   Transforms each method into a top-level function named StructName__method.
+   The 'self' param (bare or typed) is fixed up to TYPE_STRUCT+by_ref. */
+static void parse_amal(Parser *p, ASTNode *prog) {
+    parser_advance(p); /* consume 'amal' */
+    Token sname_tok = parser_expect(p, TOK_IDENTIFIER);
+    char struct_name[MAX_TOKEN_LEN];
+    vl_strncpy(struct_name, sname_tok.value, MAX_TOKEN_LEN);
+
+    parser_expect(p, TOK_LBRACE);
+    while (!parser_match(p, TOK_RBRACE) && !parser_match(p, TOK_EOF)) {
+        if (parser_match(p, TOK_SEMICOLON)) { parser_advance(p); continue; }
+
+        ASTNode *fn = parse_function(p);
+        if (!fn) continue;
+
+        /* Mangle: StructName__original_name */
+        char mangled[MAX_TOKEN_LEN];
+        snprintf(mangled, sizeof(mangled), "%s__%s", struct_name, fn->data.function.name);
+        vl_strncpy(fn->data.function.name, mangled, MAX_TOKEN_LEN);
+
+        /* Mark as impl method */
+        fn->data.function.is_method = true;
+        vl_strncpy(fn->data.function.method_struct, struct_name, MAX_TOKEN_LEN);
+
+        /* Fix up 'self' param: give it TYPE_STRUCT + by_ref so codegen
+           stores the incoming pointer and field accesses dereference it. */
+        for (int i = 0; i < fn->data.function.param_count; i++) {
+            if (strcmp(fn->data.function.param_names[i], "self") == 0) {
+                fn->data.function.param_types[i] = TYPE_STRUCT;
+                TypeInfo *ti = (TypeInfo*)calloc(1, sizeof(TypeInfo));
+                ti->kind = TYPE_STRUCT;
+                vl_strncpy(ti->struct_name, struct_name, MAX_TOKEN_LEN);
+                ti->by_ref = true;
+                fn->data.function.param_typeinfo[i] = ti;
+                fn->data.function.param_is_ref[i]   = true; /* pass by ptr */
+                break;
+            }
+        }
+
+        /* Add to program's function list */
+        if (prog->data.program.function_count < 512)
+            prog->data.program.functions[prog->data.program.function_count++] = fn;
+    }
+    parser_expect(p, TOK_RBRACE);
 }
 
 ASTNode* parse_program(Parser *p) {
@@ -1712,15 +2202,90 @@ ASTNode* parse_program(Parser *p) {
     prog->data.program.function_count = 0;
 
     while (!parser_match(p, TOK_EOF)) {
-        if (parser_match(p, TOK_ANAW))
+        if (parser_match(p, TOK_SEMICOLON)) {
+            parser_advance(p);
+        }
+        else if (parser_match(p, TOK_ANAW))
             prog->data.program.imports[prog->data.program.import_count++] =
                 parse_import(p);
         else if (parser_match(p, TOK_BINA))
             prog->data.program.structs[prog->data.program.struct_count++] =
-                parse_struct(p);
+                parse_struct(p, false);
+        else if (parser_match(p, TOK_UNION))
+            prog->data.program.structs[prog->data.program.struct_count++] =
+                parse_struct(p, true);
+        else if (parser_match(p, TOK_AMAL))
+            parse_amal(p, prog);
+        else if (parser_match(p, TOK_TADAD))
+            parse_enum(p);
+        else if (parser_match(p, TOK_SAABIT)) {
+            /* top-level saabit constant: same as statement-level */
+            parser_advance(p);
+            Token name = parser_expect(p, TOK_IDENTIFIER);
+            parser_expect(p, TOK_ASSIGN);
+            long long val = parse_enum_int_literal(p);
+            enum_const_add(name, val);
+            parser_expect(p, TOK_SEMICOLON);
+        }
         else
             prog->data.program.functions[prog->data.program.function_count++] =
                 parse_function(p);
     }
     return prog;
+}
+
+/* ------------------------------------------------------------
+ *  Pre-load saabit constants from an imported module .vel file.
+ *  Called BEFORE parsing the main program so that bare constant
+ *  names like KEY_ESCAPE resolve to integers at parse time.
+ * ------------------------------------------------------------ */
+void parser_preload_module_consts(const char *vel_path) {
+    char *src = read_file(vel_path);
+    if (!src) return;
+
+    Lexer lx; lexer_init(&lx, src);
+    Token toks[MAX_TOKENS];
+    int ntok = lexer_tokenize(&lx, toks, MAX_TOKENS);
+
+    /* Simple token scan: find TOK_SAABIT NAME = literal ; */
+    for (int i = 0; i < ntok - 3; i++) {
+        if (toks[i].type != TOK_SAABIT) continue;
+        if (toks[i+1].type != TOK_IDENTIFIER) continue;
+        if (toks[i+2].type != TOK_ASSIGN) continue;
+        /* value token */
+        int vi = i + 3;
+        bool neg = false;
+        if (vi < ntok && toks[vi].type == TOK_MINUS) { neg = true; vi++; }
+        if (vi >= ntok) continue;
+        Token vt = toks[vi];
+        long long val = 0;
+        if (vt.type == TOK_INTEGER) {
+            val = strtoll(vt.value, NULL, 10);
+        } else if (vt.type == TOK_HEX) {
+            val = strtoll(vt.value, NULL, 16);
+        } else if (vt.type == TOK_BINARY) {
+            for (int b = 0; vt.value[b]; b++)
+                val = (val << 1) + (vt.value[b] == '1' ? 1 : 0);
+        } else if (vt.type == TOK_OCTAL) {
+            val = strtoll(vt.value, NULL, 8);
+        } else if (vt.type == TOK_IDENTIFIER) {
+            /* reference to earlier constant — look up */
+            if (!enum_const_lookup(vt.value, &val)) { i = vi; continue; }
+        } else {
+            i = vi; continue;
+        }
+        if (neg) val = -val;
+        /* Add to global table (skip duplicates silently) */
+        long long existing = 0;
+        if (!enum_const_lookup(toks[i+1].value, &existing)) {
+            if (g_enum_const_count < (int)(sizeof(g_enum_consts)/sizeof(g_enum_consts[0]))) {
+                vl_strncpy(g_enum_consts[g_enum_const_count].name,
+                           toks[i+1].value, MAX_TOKEN_LEN);
+                g_enum_consts[g_enum_const_count].value = val;
+                g_enum_const_count++;
+            }
+        }
+        i = vi; /* skip ahead */
+    }
+    free(src);
 }

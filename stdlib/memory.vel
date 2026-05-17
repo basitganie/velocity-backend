@@ -1,0 +1,106 @@
+# ================================================================
+# memory — low-level memory primitives for Velocity
+# Required for self-hosting and systems programming.
+# All pointer arguments are typed as adad (opaque 64-bit address).
+#
+# Internal ASM symbols are prefixed _vel_mem__ to avoid name clash
+# with the Velocity-compiled wrappers (which compile to memory__*).
+# ================================================================
+
+# ---- Allocation --------------------------------------------------
+
+kar malloc(size: adad) -> adad {
+    chu _vel_mem__malloc(size);
+}
+
+kar calloc(n: adad, size: adad) -> adad {
+    chu _vel_mem__calloc(n, size);
+}
+
+kar realloc(ptr: adad, size: adad) -> adad {
+    chu _vel_mem__realloc(ptr, size);
+}
+
+kar free(ptr: adad) -> khali {
+    _vel_mem__free(ptr);
+}
+
+# ---- Raw memory ops ----------------------------------------------
+
+kar memcpy(dst: adad, src: adad, n: adad) -> adad {
+    chu _vel_mem__memcpy(dst, src, n);
+}
+
+kar memmove(dst: adad, src: adad, n: adad) -> adad {
+    chu _vel_mem__memmove(dst, src, n);
+}
+
+kar memset(ptr: adad, val: adad, n: adad) -> adad {
+    chu _vel_mem__memset(ptr, val, n);
+}
+
+kar memcmp(a: adad, b: adad, n: adad) -> adad {
+    chu _vel_mem__memcmp(a, b, n);
+}
+
+# ---- String (C-string) ops ---------------------------------------
+
+kar strlen(ptr: adad) -> adad {
+    chu _vel_mem__strlen(ptr);
+}
+
+kar strcmp(a: adad, b: adad) -> adad {
+    chu _vel_mem__strcmp(a, b);
+}
+
+kar strcpy(dst: adad, src: adad) -> adad {
+    chu _vel_mem__strcpy(dst, src);
+}
+
+kar strncpy(dst: adad, src: adad, n: adad) -> adad {
+    chu _vel_mem__strncpy(dst, src, n);
+}
+
+kar strcat(dst: adad, src: adad) -> adad {
+    chu _vel_mem__strcat(dst, src);
+}
+
+kar strncat(dst: adad, src: adad, n: adad) -> adad {
+    chu _vel_mem__strncat(dst, src, n);
+}
+
+kar strdup(src: adad) -> adad {
+    chu _vel_mem__strdup(src);
+}
+
+# ---- Pointer load/store primitives -------------------------------
+
+kar load64(ptr: adad) -> adad {
+    chu _vel_mem__load64(ptr);
+}
+
+kar store64(ptr: adad, val: adad) -> khali {
+    _vel_mem__store64(ptr, val);
+}
+
+kar load8(ptr: adad) -> adad {
+    chu _vel_mem__load8(ptr);
+}
+
+kar store8(ptr: adad, val: adad) -> khali {
+    _vel_mem__store8(ptr, val);
+}
+
+# ---- Pointer arithmetic helpers ----------------------------------
+
+kar ptr_add(ptr: adad, n: adad) -> adad {
+    chu ptr + n;
+}
+
+kar ptr_diff(hi: adad, lo: adad) -> adad {
+    chu hi - lo;
+}
+
+kar as_ptr(val: adad) -> adad {
+    chu val;
+}

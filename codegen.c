@@ -26,12 +26,31 @@ typedef struct FloatLit {
     ValueType type;
 } FloatLit;
 
+typedef struct {
+    ASTNode *tmpl;
+    char mangled[MAX_TOKEN_LEN * 3];
+    ValueType *param_types;
+    TypeInfo **param_typeinfo;
+    bool *param_is_ref;
+    int param_count;
+    ValueType return_type;
+    TypeInfo *return_typeinfo;
+} GenericInstantiation;
+
 /* -- Argument registers -------------------------------------------- */
 /* System V (Linux): rdi rsi rdx rcx r8 r9                          */
 /* Microsoft x64 (Windows): rcx rdx r8 r9 + shadow space            */
 static const char *SYSV_REGS[6]  = {"rdi","rsi","rdx","rcx","r8","r9"};
 static const char *WIN64_REGS[4] = {"rcx","rdx","r8","r9"};
 static const char *A64_REGS[8]   = {"x0","x1","x2","x3","x4","x5","x6","x7"};
+static const char *SYSV_SAVED_REGS[6]  = {"r10","r11","r12","r13","r14","r15"};
+static const char *WIN64_SAVED_REGS[4] = {"r10","r11","r12","r13"};
+
+static ASTNode *g_generic_templates[256];
+static int g_generic_template_count = 0;
+static GenericInstantiation g_generic_queue[512];
+static int g_generic_queue_count = 0;
+static int g_generic_queue_emit_index = 0;
 
 /* helper: return the right register for arg position i */
 static const char* arg_reg(CodeGen *cg, int i) {
@@ -47,21 +66,87 @@ static const char* arg_reg(CodeGen *cg, int i) {
     return "rax";
 }
 
+static const char* arg_saved_reg(CodeGen *cg, int i) {
+    if (cg->target_aarch64) {
+        if (i < 8) return A64_REGS[i];
+        return "x7";
+    }
+    if (cg->target_windows) {
+        if (i < 4) return WIN64_SAVED_REGS[i];
+        return "rax";
+    }
+    if (i < 6) return SYSV_SAVED_REGS[i];
+    return "rax";
+}
+
 #define ARG_REGS_MAX 8   /* AArch64 has 8; x86-64 uses up to 6 */
 
 /* -- Helpers ------------------------------------------------------- */
 static bool is_float(ValueType t)       { return t == TYPE_F32 || t == TYPE_F64; }
-static bool is_string_like(ValueType t) { return t == TYPE_STRING || t == TYPE_OPT_STRING; }
-static bool is_null_type(ValueType t)   { return t == TYPE_NULL; }
+/* static bool is_string_like(ValueType t) { return t == TYPE_STRING || t == TYPE_OPT_STRING; } */
+/* static bool is_null_type(ValueType t)   { return t == TYPE_NULL; } */
 static bool is_optional(ValueType t) {
-    return t==TYPE_OPT_STRING || t==TYPE_OPT_INT || t==TYPE_OPT_BOOL ||
-           t==TYPE_OPT_F32   || t==TYPE_OPT_F64;
+    return t==TYPE_OPT_STRING || t==TYPE_OPT_INT  || t==TYPE_OPT_BOOL ||
+           t==TYPE_OPT_F32   || t==TYPE_OPT_F64   ||
+           t==TYPE_OPT_STRUCT || t==TYPE_OPT_ARRAY;
 }
 static bool is_composite(ValueType t) {
     return t==TYPE_ARRAY || t==TYPE_TUPLE || t==TYPE_STRUCT;
 }
 static bool is_unsigned(ValueType t) {
     return t==TYPE_UINT || t==TYPE_UINT8;
+}
+static bool is_dyn_array_type(ValueType t, TypeInfo *ti) {
+    return t == TYPE_ARRAY && ti && ti->array_len < 0;
+}
+/* ---------------------------------------------------------------
+ *  amal method table helpers
+ * --------------------------------------------------------------- */
+static bool method_find(CodeGen *cg, const char *sname, const char *mname) {
+    for (int i = 0; i < cg->method_count; i++)
+        if (strcmp(cg->method_struct_tab[i], sname) == 0 &&
+            strcmp(cg->method_name_tab[i],   mname) == 0)
+            return true;
+    return false;
+}
+
+static void codegen_register_methods(CodeGen *cg, ASTNode *prog) {
+    if (!prog) return;
+    for (int i = 0; i < prog->data.program.function_count; i++) {
+        ASTNode *fn = prog->data.program.functions[i];
+        if (!fn->data.function.is_method) continue;
+        if (cg->method_count >= 1024) continue;
+        vl_strncpy(cg->method_struct_tab[cg->method_count],
+                   fn->data.function.method_struct, MAX_TOKEN_LEN);
+        /* short name = everything after StructName__ */
+        const char *sep = strstr(fn->data.function.name, "__");
+        const char *short_name = sep ? sep + 2 : fn->data.function.name;
+        vl_strncpy(cg->method_name_tab[cg->method_count], short_name, MAX_TOKEN_LEN);
+        cg->method_count++;
+    }
+}
+
+static bool is_copy_by_value_param(ValueType t, TypeInfo *ti) {
+    if (t == TYPE_STRUCT || t == TYPE_TUPLE) return true;
+    if (t == TYPE_ARRAY && ti && ti->array_len >= 0) return true;
+    return false;
+}
+static ValueType codegen_expr_a64(CodeGen *cg, ASTNode *expr);
+static TypeInfo* make_byte_buffer_typeinfo(void) {
+    TypeInfo *ti = (TypeInfo*)calloc(1, sizeof(TypeInfo));
+    if (!ti) error(ERR_FATAL, "Out of memory");
+    ti->kind = TYPE_ARRAY;
+    ti->elem_type = TYPE_UINT8;
+    ti->array_len = -1;
+    ti->is_dynamic = true;
+    return ti;
+}
+static bool is_byte_buffer(ValueType t, TypeInfo *ti) {
+    return t == TYPE_ARRAY && ti && ti->elem_type == TYPE_UINT8;
+}
+static bool is_generic_struct_slot(ValueType t, TypeInfo *ti) {
+    return t == TYPE_STRUCT && ti &&
+           (ti->generic_name[0] != '\0' || ti->struct_name[0] == '\0');
 }
 static bool symbol_has_module_prefix(const char *module, const char *name) {
     if (!module || !module[0] || !name) return false;
@@ -113,11 +198,11 @@ static void validate_unsigned_literal_range(ASTNode *expr, ValueType expect,
     int col  = (expr && expr->column > 0) ? expr->column : fallback_col;
 
     if (expect == TYPE_UINT && v < 0) {
-        error_at(line, col,
+        error_at(ERR_TYPE, line, col,
                  "uadad cannot be assigned a negative literal (%lld)", v);
     }
     if (expect == TYPE_UINT8 && (v < 0 || v > 255)) {
-        error_at(line, col,
+        error_at(ERR_TYPE, line, col,
                  "uadad8 literal out of range (%lld). Expected 0..255", v);
     }
 }
@@ -141,7 +226,11 @@ static const char *value_type_name(ValueType t) {
         case TYPE_ARRAY:      return "array";
         case TYPE_TUPLE:      return "tuple";
         case TYPE_STRUCT:     return "bina";
+        case TYPE_OPT_STRUCT: return "bina?";
+        case TYPE_OPT_ARRAY:  return "array?";
         case TYPE_ERROR_VAL:  return "error";
+        case TYPE_PTR:        return "*adad";
+        case TYPE_FUNCPTR:    return "kar";
         default:              return "unknown";
     }
 }
@@ -150,6 +239,10 @@ static const char *value_type_name(ValueType t) {
 static StructDef* struct_find(CodeGen *cg, const char *name);
 static int        struct_size(CodeGen *cg, StructDef *sd);
 static TypeInfo*  typeinfo_clone(TypeInfo *ti);
+static void       func_sig_add(CodeGen *cg, const char *name,
+                               ValueType ret, TypeInfo *ret_ti,
+                               ValueType *ptypes, TypeInfo **ptinfo,
+                               int pcount);
 static ValueType  codegen_cast(CodeGen *cg, ValueType from, ValueType to);
 static bool       mod_func_table_has(const char *name);
 static FunctionSig* func_sig_find(CodeGen *cg, const char *name);
@@ -162,15 +255,20 @@ static ValueType  infer_expr_type(CodeGen *cg, ASTNode *expr);
 static TypeInfo*  expr_typeinfo(CodeGen *cg, ASTNode *expr);
 static void       codegen_copy_struct(CodeGen *cg, StructDef *sd,
                                       const char *dst, const char *src);
+static ASTNode*    find_generic_template(const char *name);
+static bool        queue_generic_instantiation(CodeGen *cg, ASTNode *tmpl,
+                                               ASTNode **args, int argc,
+                                               char *mangled, size_t mangled_sz);
+static void        emit_pending_generic_instantiations(CodeGen *cg);
 
 /* -- Array element size -------------------------------------------- */
 static int array_elem_size(CodeGen *cg, TypeInfo *ti) {
     if (!ti) return 8;
     if (ti->elem_type == TYPE_UINT8) return 1;
     if (ti->elem_type == TYPE_STRUCT) {
-        if (!ti->elem_typeinfo) error("array element missing struct type info");
+        if (!ti->elem_typeinfo) error(ERR_CODEGEN, "array element missing struct type info");
         StructDef *sd = struct_find(cg, ti->elem_typeinfo->struct_name);
-        if (!sd) error("Unknown struct type: %s", ti->elem_typeinfo->struct_name);
+        if (!sd) error(ERR_TYPE, "Unknown struct type: %s", ti->elem_typeinfo->struct_name);
         return struct_size(cg, sd);
     }
     return 8;
@@ -180,17 +278,17 @@ static int array_elem_size(CodeGen *cg, TypeInfo *ti) {
 static int typeinfo_size(CodeGen *cg, ValueType t, TypeInfo *ti) {
     if (t == TYPE_STRUCT) {
         if (!ti || ti->struct_name[0] == '\0') return 8; /* unknown struct: ptr size */
-        if (ti->by_ref) return 8;
+        if (ti->by_ref || ti->is_ref) return 8;
         StructDef *sd = struct_find(cg, ti->struct_name);
-        if (!sd) error("Unknown struct: %s", ti->struct_name);
+        if (!sd) error(ERR_TYPE, "Unknown struct: %s", ti->struct_name);
         return struct_size(cg, sd);
     }
     if (t == TYPE_ARRAY && ti) {
-        if (ti->by_ref || ti->array_len < 0) return 8;
+        if (ti->by_ref || ti->is_ref || ti->array_len < 0) return 8;
         return ti->array_len * array_elem_size(cg, ti);
     }
     if (t == TYPE_TUPLE && ti) {
-        if (ti->by_ref) return 8;
+        if (ti->by_ref || ti->is_ref) return 8;
         return ti->tuple_count * 8;
     }
     if (t == TYPE_UINT8) return 1;
@@ -210,7 +308,7 @@ void codegen_init(CodeGen *cg, FILE *output, ModuleManager *mgr,
     cg->target_windows  = target_windows;
     cg->target_aarch64  = target_aarch64;
     if (module_prefix && module_prefix[0])
-        strncpy(cg->module_prefix, module_prefix, MAX_TOKEN_LEN-1);
+        vl_strncpy(cg->module_prefix, module_prefix, MAX_TOKEN_LEN);
     cg->local_vars     = (char**)malloc(sizeof(char*) * MAX_VARS);
     cg->var_offsets    = (int*)malloc(sizeof(int) * MAX_VARS);
     cg->var_types      = (ValueType*)malloc(sizeof(ValueType) * MAX_VARS);
@@ -234,21 +332,21 @@ int codegen_new_label(CodeGen *cg) { return cg->label_counter++; }
  *  Loop stack
  * ------------------------------------------------------------ */
 static void loop_push(CodeGen *cg, int cont, int brk) {
-    if (cg->loop_depth >= MAX_LOOP_DEPTH) error("loop nesting too deep");
+    if (cg->loop_depth >= MAX_LOOP_DEPTH) error(ERR_CODEGEN, "loop nesting too deep");
     cg->loop_continue_labels[cg->loop_depth] = cont;
     cg->loop_break_labels[cg->loop_depth]    = brk;
     cg->loop_depth++;
 }
 static void loop_pop(CodeGen *cg) {
-    if (cg->loop_depth <= 0) error("loop stack underflow");
+    if (cg->loop_depth <= 0) error(ERR_CODEGEN, "loop stack underflow");
     cg->loop_depth--;
 }
 static int loop_cont(CodeGen *cg) {
-    if (cg->loop_depth<=0) error("'continue' outside loop");
+    if (cg->loop_depth<=0) error(ERR_SYNTAX, "'continue' outside loop");
     return cg->loop_continue_labels[cg->loop_depth-1];
 }
 static int loop_brk(CodeGen *cg) {
-    if (cg->loop_depth<=0) error("'break' outside loop");
+    if (cg->loop_depth<=0) error(ERR_SYNTAX, "'break' outside loop");
     return cg->loop_break_labels[cg->loop_depth-1];
 }
 
@@ -260,10 +358,11 @@ static void emit_try_error_probe(CodeGen *cg) {
     int ok_l = codegen_new_label(cg);
     codegen_emit(cg,"    cmp qword [rel _VL_err_flag], 0");
     codegen_emit(cg,"    je  _VL%d", ok_l);
-    codegen_emit(cg,"    mov rax, [rel _VL_err_msg]");
+    codegen_emit(cg,"    mov rax, [rel _VL_err_code]");  /* raw thrown value */
     codegen_emit(cg,"    mov [rbp - %d], rax", evar_off);
     codegen_emit(cg,"    mov qword [rel _VL_err_flag], 0");
     codegen_emit(cg,"    mov qword [rel _VL_err_msg], 0");
+    codegen_emit(cg,"    mov qword [rel _VL_err_code], 0");
     codegen_emit(cg,"    sub qword [rel _VL_try_depth_rt], 1");
     codegen_emit(cg,"    jmp _VL%d", catch_l);
     codegen_emit(cg,"_VL%d:", ok_l);
@@ -290,18 +389,26 @@ static int struct_field_index(StructDef *sd, const char *field) {
 static int struct_size(CodeGen *cg, StructDef *sd) {
     if (!sd) return 0;
     if (sd->size >= 0) return sd->size;
-    if (sd->sizing) error("Recursive struct: %s", sd->name);
+    if (sd->sizing) error(ERR_TYPE, "Recursive struct: %s", sd->name);
     sd->sizing = true;
     int offset = 0;
+    int max_field = 0;
     for (int i = 0; i < sd->field_count; i++) {
         ValueType ft = sd->field_types[i];
         TypeInfo *fti = sd->field_typeinfo ? sd->field_typeinfo[i] : NULL;
         int fsize;
         if (ft == TYPE_STRUCT) {
-            if (!fti) error("struct field missing type info: %s.%s",
+            if (!fti) error(ERR_CODEGEN, "struct field missing type info: %s.%s",
                             sd->name, sd->field_names[i]);
+            if (is_generic_struct_slot(ft, fti)) {
+                /* Erased generic slot (e.g. T) currently stored as one word. */
+                fsize = 8;
+                sd->field_offsets[i] = offset;
+                offset += fsize;
+                continue;
+            }
             StructDef *inner = struct_find(cg, fti->struct_name);
-            if (!inner) error("Unknown struct '%s' in %s.%s",
+            if (!inner) error(ERR_TYPE, "Unknown struct '%s' in %s.%s",
                               fti->struct_name, sd->name, sd->field_names[i]);
             fsize = struct_size(cg, inner);
         } else if (ft == TYPE_ARRAY && fti) {
@@ -313,12 +420,17 @@ static int struct_size(CodeGen *cg, StructDef *sd) {
         } else {
             fsize = 8;
         }
-        sd->field_offsets[i] = offset;
-        offset += fsize;
+        if (sd->is_union) {
+            sd->field_offsets[i] = 0;
+            if (fsize > max_field) max_field = fsize;
+        } else {
+            sd->field_offsets[i] = offset;
+            offset += fsize;
+        }
     }
-    sd->size = offset;
+    sd->size = sd->is_union ? max_field : offset;
     sd->sizing = false;
-    return offset;
+    return sd->size;
 }
 
 static void struct_add_from_ast(CodeGen *cg, ASTNode *def) {
@@ -330,13 +442,14 @@ static void struct_add_from_ast(CodeGen *cg, ASTNode *def) {
         int nc = cg->struct_cap == 0 ? 8 : cg->struct_cap * 2;
         cg->struct_defs = (StructDef*)realloc(cg->struct_defs,
                                                sizeof(StructDef) * nc);
-        if (!cg->struct_defs) error("Out of memory");
+        if (!cg->struct_defs) error(ERR_FATAL, "Out of memory");
         cg->struct_cap = nc;
     }
     StructDef *sd = &cg->struct_defs[cg->struct_count++];
     memset(sd, 0, sizeof(*sd));
-    strncpy(sd->name, def->data.struct_def.name, MAX_TOKEN_LEN-1);
+    vl_strncpy(sd->name, def->data.struct_def.name, MAX_TOKEN_LEN);
     sd->field_count = def->data.struct_def.field_count;
+    sd->is_union = def->data.struct_def.is_union;
     sd->size = -1;
 
     if (sd->field_count > 0) {
@@ -366,7 +479,7 @@ static void codegen_register_structs(CodeGen *cg, ASTNode *prog) {
 static TypeInfo* typeinfo_clone(TypeInfo *ti) {
     if (!ti) return NULL;
     TypeInfo *c = (TypeInfo*)calloc(1, sizeof(TypeInfo));
-    if (!c) error("Out of memory");
+    if (!c) error(ERR_FATAL, "Out of memory");
     *c = *ti;
     c->tuple_types  = NULL;
     c->elem_typeinfo = NULL;
@@ -379,6 +492,197 @@ static TypeInfo* typeinfo_clone(TypeInfo *ti) {
     if (ti->kind == TYPE_ARRAY && ti->elem_typeinfo)
         c->elem_typeinfo = typeinfo_clone(ti->elem_typeinfo);
     return c;
+}
+
+static void generic_type_name(ValueType t, TypeInfo *ti,
+                              char *out, size_t out_sz) {
+    if (!out || out_sz == 0) return;
+    switch (t) {
+        case TYPE_INT:    snprintf(out, out_sz, "adad"); return;
+        case TYPE_UINT:   snprintf(out, out_sz, "uadad"); return;
+        case TYPE_UINT8:  snprintf(out, out_sz, "uadad8"); return;
+        case TYPE_BOOL:   snprintf(out, out_sz, "bool"); return;
+        case TYPE_F32:    snprintf(out, out_sz, "ashari32"); return;
+        case TYPE_F64:    snprintf(out, out_sz, "ashari"); return;
+        case TYPE_STRING: snprintf(out, out_sz, "lafz"); return;
+        case TYPE_ARRAY: {
+            char elem[64] = "adad";
+            if (ti) generic_type_name(ti->elem_type, ti->elem_typeinfo, elem, sizeof(elem));
+            snprintf(out, out_sz, "arr_%s", elem);
+            return;
+        }
+        case TYPE_STRUCT:
+            if (ti && ti->struct_name[0]) {
+                snprintf(out, out_sz, "%s", ti->struct_name);
+                return;
+            }
+            snprintf(out, out_sz, "bina");
+            return;
+        case TYPE_TUPLE:
+            snprintf(out, out_sz, "tuple");
+            return;
+        default:
+            snprintf(out, out_sz, "%s", value_type_name(t));
+            return;
+    }
+}
+
+static ASTNode* find_generic_template(const char *name) {
+    if (!name) return NULL;
+    for (int i = 0; i < g_generic_template_count; i++) {
+        ASTNode *tmpl = g_generic_templates[i];
+        if (tmpl && strcmp(tmpl->data.function.name, name) == 0)
+            return tmpl;
+    }
+    return NULL;
+}
+
+static bool queue_generic_instantiation(CodeGen *cg, ASTNode *tmpl,
+                                        ASTNode **args, int argc,
+                                        char *mangled, size_t mangled_sz) {
+    if (!cg || !tmpl || tmpl->type != AST_FUNCTION) return false;
+
+    int gcount = tmpl->data.function.generic_count;
+    ValueType concrete_types[8];
+    TypeInfo *concrete_ti[8];
+    char concrete_names[8][64];
+    for (int g = 0; g < gcount; g++) {
+        concrete_types[g] = TYPE_INT;
+        concrete_ti[g] = NULL;
+        snprintf(concrete_names[g], sizeof(concrete_names[g]), "adad");
+    }
+
+    for (int a = 0; a < argc && a < tmpl->data.function.param_count; a++) {
+        TypeInfo *pti = tmpl->data.function.param_typeinfo
+                        ? tmpl->data.function.param_typeinfo[a] : NULL;
+        if (!pti || !pti->generic_name[0]) continue;
+
+        int gslot = -1;
+        for (int g = 0; g < gcount; g++) {
+            if (strcmp(pti->generic_name, tmpl->data.function.generic_params[g]) == 0) {
+                gslot = g;
+                break;
+            }
+        }
+        if (gslot < 0) continue;
+
+        ValueType at = infer_expr_type(cg, args[a]);
+        TypeInfo *ati = expr_typeinfo(cg, args[a]);
+        concrete_types[gslot] = at;
+        concrete_ti[gslot] = ati;
+        generic_type_name(at, ati, concrete_names[gslot], sizeof(concrete_names[gslot]));
+    }
+
+    snprintf(mangled, mangled_sz, "%s", tmpl->data.function.name);
+    for (int g = 0; g < gcount; g++) {
+        char part[80];
+        snprintf(part, sizeof(part), "__%s", concrete_names[g]);
+        strncat(mangled, part, mangled_sz - strlen(mangled) - 1);
+    }
+
+    if (func_sig_find(cg, mangled))
+        return true;
+    for (int i = 0; i < g_generic_queue_count; i++) {
+        if (strcmp(g_generic_queue[i].mangled, mangled) == 0)
+            return true;
+    }
+    if (g_generic_queue_count >= 512)
+        error(ERR_FATAL, "too many generic instantiations");
+
+    int pcount = tmpl->data.function.param_count;
+    ValueType *cptypes = (ValueType*)malloc(sizeof(ValueType) * pcount);
+    TypeInfo **cpti = (TypeInfo**)calloc(pcount, sizeof(TypeInfo*));
+    bool *cpref = (bool*)calloc(pcount, sizeof(bool));
+
+    for (int p = 0; p < pcount; p++) {
+        TypeInfo *opti = tmpl->data.function.param_typeinfo
+                         ? tmpl->data.function.param_typeinfo[p] : NULL;
+        if (opti && opti->generic_name[0]) {
+            int gslot = -1;
+            for (int g = 0; g < gcount; g++) {
+                if (strcmp(opti->generic_name, tmpl->data.function.generic_params[g]) == 0) {
+                    gslot = g;
+                    break;
+                }
+            }
+            if (gslot >= 0) {
+                cptypes[p] = concrete_types[gslot];
+                cpti[p] = typeinfo_clone(concrete_ti[gslot]);
+            } else {
+                cptypes[p] = tmpl->data.function.param_types[p];
+                cpti[p] = typeinfo_clone(opti);
+            }
+        } else {
+            cptypes[p] = tmpl->data.function.param_types[p];
+            cpti[p] = typeinfo_clone(opti);
+        }
+        if (tmpl->data.function.param_is_ref)
+            cpref[p] = tmpl->data.function.param_is_ref[p];
+    }
+
+    ValueType cret = tmpl->data.function.return_type;
+    TypeInfo *crti = NULL;
+    TypeInfo *orti = tmpl->data.function.return_typeinfo;
+    if (orti && orti->generic_name[0]) {
+        for (int g = 0; g < gcount; g++) {
+            if (strcmp(orti->generic_name, tmpl->data.function.generic_params[g]) == 0) {
+                cret = concrete_types[g];
+                crti = typeinfo_clone(concrete_ti[g]);
+                break;
+            }
+        }
+    } else {
+        crti = typeinfo_clone(orti);
+    }
+
+    func_sig_add(cg, mangled, cret, crti, cptypes, cpti, pcount);
+    FunctionSig *sig = func_sig_find(cg, mangled);
+    if (sig && pcount > 0) {
+        sig->param_is_ref = (bool*)calloc(pcount, sizeof(bool));
+        for (int i = 0; i < pcount; i++)
+            sig->param_is_ref[i] = cpref[i];
+    }
+
+    GenericInstantiation *inst = &g_generic_queue[g_generic_queue_count++];
+    memset(inst, 0, sizeof(*inst));
+    inst->tmpl = tmpl;
+    vl_strncpy(inst->mangled, mangled, sizeof(inst->mangled));
+    inst->param_types = cptypes;
+    inst->param_typeinfo = cpti;
+    inst->param_is_ref = cpref;
+    inst->param_count = pcount;
+    inst->return_type = cret;
+    inst->return_typeinfo = crti;
+    return true;
+}
+
+static void emit_pending_generic_instantiations(CodeGen *cg) {
+    while (g_generic_queue_emit_index < g_generic_queue_count) {
+        GenericInstantiation inst = g_generic_queue[g_generic_queue_emit_index++];
+        ASTNode *cfn = ast_node_new(AST_FUNCTION);
+        vl_strncpy(cfn->data.function.name, inst.mangled, MAX_TOKEN_LEN);
+        cfn->data.function.generic_count = 0;
+        cfn->data.function.is_exported = true;
+        cfn->data.function.body = inst.tmpl->data.function.body;
+        cfn->data.function.body_count = inst.tmpl->data.function.body_count;
+        cfn->data.function.param_count = inst.param_count;
+        cfn->data.function.param_names = inst.tmpl->data.function.param_names;
+        cfn->data.function.param_types = inst.param_types;
+        cfn->data.function.param_typeinfo = inst.param_typeinfo;
+        cfn->data.function.param_is_ref = inst.param_is_ref;
+        cfn->data.function.return_type = inst.return_type;
+        cfn->data.function.return_typeinfo = inst.return_typeinfo;
+        cfn->line = inst.tmpl->line;
+        cfn->column = inst.tmpl->column;
+
+        codegen_function(cg, cfn);
+
+        cfn->data.function.body = NULL;
+        cfn->data.function.param_names = NULL;
+        cfn->data.function.body_count = 0;
+        cfn->data.function.param_count = 0;
+        ast_node_free(cfn);
+    }
 }
 
 static TypeInfo* typeinfo_ref(TypeInfo *ti) {
@@ -408,12 +712,12 @@ static void func_sig_add(CodeGen *cg, const char *name,
         int nc = cg->func_sig_cap == 0 ? 32 : cg->func_sig_cap * 2;
         cg->func_sigs = (FunctionSig*)realloc(cg->func_sigs,
                                                sizeof(FunctionSig)*nc);
-        if (!cg->func_sigs) error("Out of memory");
+        if (!cg->func_sigs) error(ERR_FATAL, "Out of memory");
         cg->func_sig_cap = nc;
     }
     FunctionSig *sig = &cg->func_sigs[cg->func_sig_count++];
     memset(sig, 0, sizeof(*sig));
-    strncpy(sig->name, name, sizeof(sig->name)-1);
+    vl_strncpy(sig->name, name, sizeof(sig->name));
     sig->return_type    = ret;
     sig->return_typeinfo = typeinfo_clone(ret_ti);
     sig->param_count    = pcount;
@@ -435,6 +739,16 @@ static FunctionSig* func_sig_find(CodeGen *cg, const char *name) {
     return NULL;
 }
 
+static void validate_io_buffer_arg(CodeGen *cg, ASTNode *arg, int line, int column,
+                                   const char *fn_name) {
+    ValueType at = infer_expr_type(cg, arg);
+    TypeInfo *ti = expr_typeinfo(cg, arg);
+    if (is_byte_buffer(at, ti)) return;
+    error_at(ERR_TYPE, line, column,
+             "io.%s expects a [harf] or [uadad8] buffer as argument 2",
+             fn_name);
+}
+
 /* -- Register built-in module signatures --------------------------- */
 static void register_builtin_module_sigs(CodeGen *cg, const char *mod) {
     if (!mod) return;
@@ -443,19 +757,33 @@ static void register_builtin_module_sigs(CodeGen *cg, const char *mod) {
     if (strcmp(mod, "io") == 0) {
         ValueType p1i[1]={ti};
         ValueType p2si[2]={ts,ti};
+        TypeInfo *p_read_ti[3]={NULL, make_byte_buffer_typeinfo(), NULL};
         func_sig_add(cg, "io__input", ti, NULL, NULL, NULL, 0);
         func_sig_add(cg, "io__stdin", ts, NULL, NULL, NULL, 0);
         func_sig_add(cg, "io__chhaap", ti, NULL, NULL, NULL, 0);
         func_sig_add(cg, "io__chhaapLine", ti, NULL, NULL, NULL, 0);
         func_sig_add(cg, "io__chhaapSpace", ti, NULL, NULL, NULL, 0);
+        func_sig_add(cg, "io__putchar", ti, NULL, p1i, NULL, 1);
         func_sig_add(cg, "io__open", ti, NULL, p2si, NULL, 2);
         func_sig_add(cg, "io__fopen", ti, NULL, p2si, NULL, 2);
         func_sig_add(cg, "io__close", ti, NULL, p1i, NULL, 1);
         func_sig_add(cg, "io__fclose", ti, NULL, p1i, NULL, 1);
         /* io.read(fd, buf, len) -> adad   io.write(fd, buf, len) -> adad */
-        ValueType p_read[3]={ti,ts,ti};
-        func_sig_add(cg, "io__read",  ti, NULL, p_read, NULL, 3);
-        func_sig_add(cg, "io__write", ti, NULL, p_read, NULL, 3);
+        ValueType p_read[3]={ti,TYPE_ARRAY,ti};
+        func_sig_add(cg, "io__read",  ti, NULL, p_read, p_read_ti, 3);
+        func_sig_add(cg, "io__write", ti, NULL, p_read, p_read_ti, 3);
+        ValueType p2ii[2]={ti,ti};
+        func_sig_add(cg, "io__write_byte", ti, NULL, p2ii, NULL, 2);
+        /* new io functions */
+        func_sig_add(cg, "io__getchar",     ti, NULL, NULL,   NULL, 0);
+        { ValueType p1s_io[1]={ts};
+          ValueType p2ss_io[2]={ts,ts};
+          func_sig_add(cg, "io__file_read",   ts, NULL, p1s_io,  NULL, 1);
+          func_sig_add(cg, "io__file_write",  ti, NULL, p2ss_io, NULL, 2);
+          func_sig_add(cg, "io__file_exists", ti, NULL, p1s_io,  NULL, 1);
+          func_sig_add(cg, "io__file_delete", ti, NULL, p1s_io,  NULL, 1);
+          func_sig_add(cg, "io__file_append", ti, NULL, p2ss_io, NULL, 2); }
+        typeinfo_free(p_read_ti[1]);
     } else if (strcmp(mod, "lafz") == 0) {
         ValueType p1s[1]={ts}, p2s[2]={ts,ts}, p3s[3]={ts,ti,ti};
         ValueType p1i[1]={ti}, p1f[1]={tf};
@@ -467,6 +795,38 @@ static void register_builtin_module_sigs(CodeGen *cg, const char *mod) {
         func_sig_add(cg,"lafz__from_ashari",ts,NULL,p1f,NULL,1);
         func_sig_add(cg,"lafz__to_adad",  ti,NULL, p1s,NULL,1);
         func_sig_add(cg,"lafz__to_ashari",tf,NULL, p1s,NULL,1);
+        func_sig_add(cg,"lafz__find",        ti,NULL,p2s,NULL,2);
+        func_sig_add(cg,"lafz__contains",    ti,NULL,p2s,NULL,2);
+        func_sig_add(cg,"lafz__starts_with", ti,NULL,p2s,NULL,2);
+        func_sig_add(cg,"lafz__ends_with",   ti,NULL,p2s,NULL,2);
+        func_sig_add(cg,"lafz__trim",        ts,NULL,p1s,NULL,1);
+        func_sig_add(cg,"lafz__upper",       ts,NULL,p1s,NULL,1);
+        func_sig_add(cg,"lafz__lower",       ts,NULL,p1s,NULL,1);
+        { ValueType p3r[3]={ts,ti,ti};
+          func_sig_add(cg,"lafz__replace",   ts,NULL,p3r,NULL,3); }
+        /* lafz.format(fmt, ...) -> lafz  (variadic: registered with 0 params) */
+        func_sig_add(cg,"lafz__format",      ts,NULL,NULL,NULL,0);
+        /* lafz.repeat(s, n) -> lafz */
+        { ValueType p2si[2]={ts,ti};
+          func_sig_add(cg,"lafz__repeat",    ts,NULL,p2si,NULL,2); }
+        /* lafz.count(s, needle) -> adad */
+        func_sig_add(cg,"lafz__count",       ti,NULL,p2s,NULL,2);
+        /* lafz.pad_left(s, width, ch) / lafz.pad_right(s, width, ch) -> lafz */
+        { ValueType p3sii[3]={ts,ti,ti};
+          func_sig_add(cg,"lafz__pad_left",  ts,NULL,p3sii,NULL,3);
+          func_sig_add(cg,"lafz__pad_right", ts,NULL,p3sii,NULL,3); }
+        /* lafz.char_at(s, i) -> adad */
+        func_sig_add(cg,"lafz__char_at",     ti,NULL,p2s,NULL,2);
+        /* lafz.set_char(s, i, ch) -> khali */
+        { ValueType p3sii2[3]={ts,ti,ti};
+          func_sig_add(cg,"lafz__set_char",  TYPE_INT,NULL,p3sii2,NULL,3); }
+        /* new lafz functions */
+        { ValueType p2si_spl[2]={ts,ti};
+          func_sig_add(cg,"lafz__split",     TYPE_ARRAY,NULL,p2si_spl,NULL,2); }
+        { ValueType p2s_jn[2]={TYPE_ARRAY,ts};
+          func_sig_add(cg,"lafz__join",      ts,NULL,p2s_jn,NULL,2); }
+        { ValueType p1i_fh[1]={ti};
+          func_sig_add(cg,"lafz__from_harf", ts,NULL,p1i_fh,NULL,1); }
     } else if (strcmp(mod, "time") == 0) {
         ValueType p1i[1]={ti};
         func_sig_add(cg,"time__now",    ti,NULL,NULL,NULL,0);
@@ -485,22 +845,491 @@ static void register_builtin_module_sigs(CodeGen *cg, const char *mod) {
         func_sig_add(cg,"system__argc",   ti,NULL,NULL,NULL,0);
         func_sig_add(cg,"system__argv",   TYPE_OPT_STRING,NULL,p1i,NULL,1);
         func_sig_add(cg,"system__getenv", TYPE_OPT_STRING,NULL,p1s,NULL,1);
+        /* system.cmd captures stdout → returns lafz */
+        func_sig_add(cg,"system__cmd",    ts,NULL,p1s,NULL,1);
+        /* system.run just runs, returns exit code → adad */
+        func_sig_add(cg,"system__run",    ti,NULL,p1s,NULL,1);
+        /* filesystem functions */
+        func_sig_add(cg,"system__getcwd", ts,NULL,NULL, NULL,0);
+        func_sig_add(cg,"system__chdir",  ti,NULL,p1s,  NULL,1);
+        func_sig_add(cg,"system__mkdir",  ti,NULL,p1s,  NULL,1);
+        func_sig_add(cg,"system__exists", ti,NULL,p1s,  NULL,1);
+        func_sig_add(cg,"system__rm",     ti,NULL,p1s,  NULL,1);
+        /* OS-level syscalls for system/kernel programming */
+        ValueType p4iiii[4]={ti,ti,ti,ti};
+        ValueType p2ii[2]={ti,ti};
+        ValueType p3iii[3]={ti,ti,ti};
+        func_sig_add(cg,"system__mmap",      ti,NULL,p4iiii,NULL,4);
+        func_sig_add(cg,"system__munmap",    ti,NULL,p2ii,  NULL,2);
+        func_sig_add(cg,"system__mprotect",  ti,NULL,p3iii, NULL,3);
+        func_sig_add(cg,"system__sleep",     ti,NULL,p1i,   NULL,1);
+        func_sig_add(cg,"system__usleep",    ti,NULL,p1i,   NULL,1);
+        func_sig_add(cg,"system__getpid",    ti,NULL,NULL,  NULL,0);
+        func_sig_add(cg,"system__getppid",   ti,NULL,NULL,  NULL,0);
+        func_sig_add(cg,"system__kill",      ti,NULL,p2ii,  NULL,2);
+        { ValueType p3sii[3]={ts,ti,ti};
+          func_sig_add(cg,"system__open",   ti,NULL,p3sii, NULL,3); }
+        func_sig_add(cg,"system__close",     ti,NULL,p1i,   NULL,1);
+        func_sig_add(cg,"system__read_fd",   ti,NULL,p3iii, NULL,3);
+        func_sig_add(cg,"system__write_fd",  ti,NULL,p3iii, NULL,3);
+        func_sig_add(cg,"system__seek",      ti,NULL,p3iii, NULL,3);
+        func_sig_add(cg,"system__stat_size", ti,NULL,p1s,   NULL,1);
+        func_sig_add(cg,"system__ioctl",     ti,NULL,p3iii, NULL,3);
+        /* uname / time_ms — added v0.3.2 */
+        func_sig_add(cg,"system__uname",     ts,NULL,NULL,  NULL,0);
+        func_sig_add(cg,"system__time_ms",   ti,NULL,NULL,  NULL,0);
     } else if (strcmp(mod, "os") == 0) {
         ValueType p1s[1]={ts};
         func_sig_add(cg,"os__getcwd",TYPE_OPT_STRING,NULL,NULL,NULL,0);
         func_sig_add(cg,"os__chdir", ti,NULL,p1s,NULL,1);
+    } else if (strcmp(mod, "memory") == 0) {
+        ValueType p1i[1]={ti};
+        ValueType p1p[1]={TYPE_PTR};
+        ValueType p2pi[2]={TYPE_PTR,ti};
+        ValueType p2ii[2]={ti,ti};
+        ValueType p3ppi[3]={TYPE_PTR,TYPE_PTR,ti};
+        ValueType p3pii[3]={TYPE_PTR,ti,ti};
+        func_sig_add(cg,"memory__malloc",  TYPE_PTR,NULL,p1i,    NULL,1);
+        func_sig_add(cg,"memory__calloc",  TYPE_PTR,NULL,p2ii,   NULL,2);
+        func_sig_add(cg,"memory__realloc", TYPE_PTR,NULL,p2pi,   NULL,2);
+        func_sig_add(cg,"memory__free",    TYPE_INT,NULL,p1p,    NULL,1);
+        func_sig_add(cg,"memory__memcpy",  TYPE_PTR,NULL,p3ppi,  NULL,3);
+        func_sig_add(cg,"memory__memmove", TYPE_PTR,NULL,p3ppi,  NULL,3);
+        func_sig_add(cg,"memory__memset",  TYPE_PTR,NULL,p3pii,  NULL,3);
+        func_sig_add(cg,"memory__memcmp",  ti,      NULL,p3ppi,  NULL,3);
+        func_sig_add(cg,"memory__strlen",  ti,      NULL,p1p,    NULL,1);
+        func_sig_add(cg,"memory__strcmp",  ti,      NULL,(ValueType[]){TYPE_PTR,TYPE_PTR},NULL,2);
+        func_sig_add(cg,"memory__strcpy",  TYPE_PTR,NULL,(ValueType[]){TYPE_PTR,TYPE_PTR},NULL,2);
+        func_sig_add(cg,"memory__strncpy", TYPE_PTR,NULL,p3ppi,  NULL,3);
+        func_sig_add(cg,"memory__strcat",  TYPE_PTR,NULL,(ValueType[]){TYPE_PTR,TYPE_PTR},NULL,2);
+        func_sig_add(cg,"memory__strncat", TYPE_PTR,NULL,p3ppi,  NULL,3);
+        func_sig_add(cg,"memory__strdup",  TYPE_PTR,NULL,p1p,    NULL,1);
+        func_sig_add(cg,"memory__addr_of", TYPE_PTR,NULL,p1i,    NULL,1);
+        func_sig_add(cg,"memory__load64",  ti,      NULL,p1p,    NULL,1);
+        func_sig_add(cg,"memory__store64", TYPE_INT,NULL,p2pi,   NULL,2);
+        func_sig_add(cg,"memory__load8",   ti,      NULL,p1p,    NULL,1);
+        func_sig_add(cg,"memory__store8",  TYPE_INT,NULL,p2pi,   NULL,2);
     } else if (strcmp(mod, "math") == 0) {
-        ValueType p1f[1]={tf};
-        ValueType p2pow[2]={tf, TYPE_INT};
-        func_sig_add(cg,"math__sqrt",  tf,NULL,p1f,NULL,1);
-        func_sig_add(cg,"math__abs",   tf,NULL,p1f,NULL,1);
-        func_sig_add(cg,"math__floor", tf,NULL,p1f,NULL,1);
-        func_sig_add(cg,"math__ceil",  tf,NULL,p1f,NULL,1);
-        func_sig_add(cg,"math__pow",   tf,NULL,p2pow,NULL,2);
-        func_sig_add(cg,"math__sin",   tf,NULL,p1f,NULL,1);
-        func_sig_add(cg,"math__cos",   tf,NULL,p1f,NULL,1);
-        func_sig_add(cg,"math__tan",   tf,NULL,p1f,NULL,1);
-        func_sig_add(cg,"math__log",   tf,NULL,p1f,NULL,1);
+        ValueType p1f[1]={tf}, p1i[1]={ti};
+        ValueType p2ff[2]={tf,tf}, p2fi[2]={tf,ti};
+        ValueType p2ii[2]={ti,ti}, p3iii[3]={ti,ti,ti};
+        ValueType p4ffff[4]={tf,tf,tf,tf};
+        ValueType p2fa[2]={tf,TYPE_ARRAY};
+        /* constants */
+        func_sig_add(cg,"math__pi",       tf,NULL,NULL,   NULL,0);
+        func_sig_add(cg,"math__tau",      tf,NULL,NULL,   NULL,0);
+        func_sig_add(cg,"math__e",        tf,NULL,NULL,   NULL,0);
+        func_sig_add(cg,"math__inf",      tf,NULL,NULL,   NULL,0);
+        func_sig_add(cg,"math__nan",      tf,NULL,NULL,   NULL,0);
+        /* f64 → f64 */
+        func_sig_add(cg,"math__sqrt",     tf,NULL,p1f,   NULL,1);
+        func_sig_add(cg,"math__cbrt",     tf,NULL,p1f,   NULL,1);
+        func_sig_add(cg,"math__abs",      tf,NULL,p1f,   NULL,1);
+        func_sig_add(cg,"math__fabs",     tf,NULL,p1f,   NULL,1);
+        func_sig_add(cg,"math__floor",    tf,NULL,p1f,   NULL,1);
+        func_sig_add(cg,"math__ceil",     tf,NULL,p1f,   NULL,1);
+        func_sig_add(cg,"math__trunc",    tf,NULL,p1f,   NULL,1);
+        func_sig_add(cg,"math__round_internal",tf,NULL,p1f,NULL,1);
+        func_sig_add(cg,"math__exp",      tf,NULL,p1f,   NULL,1);
+        func_sig_add(cg,"math__exp2",     tf,NULL,p1f,   NULL,1);
+        func_sig_add(cg,"math__expm1",    tf,NULL,p1f,   NULL,1);
+        func_sig_add(cg,"math__log",      tf,NULL,p1f,   NULL,1);
+        func_sig_add(cg,"math__log2",     tf,NULL,p1f,   NULL,1);
+        func_sig_add(cg,"math__log10",    tf,NULL,p1f,   NULL,1);
+        func_sig_add(cg,"math__log1p",    tf,NULL,p1f,   NULL,1);
+        func_sig_add(cg,"math__sin",      tf,NULL,p1f,   NULL,1);
+        func_sig_add(cg,"math__cos",      tf,NULL,p1f,   NULL,1);
+        func_sig_add(cg,"math__tan",      tf,NULL,p1f,   NULL,1);
+        func_sig_add(cg,"math__asin",     tf,NULL,p1f,   NULL,1);
+        func_sig_add(cg,"math__acos",     tf,NULL,p1f,   NULL,1);
+        func_sig_add(cg,"math__atan",     tf,NULL,p1f,   NULL,1);
+        func_sig_add(cg,"math__sinh",     tf,NULL,p1f,   NULL,1);
+        func_sig_add(cg,"math__cosh",     tf,NULL,p1f,   NULL,1);
+        func_sig_add(cg,"math__tanh",     tf,NULL,p1f,   NULL,1);
+        func_sig_add(cg,"math__asinh",    tf,NULL,p1f,   NULL,1);
+        func_sig_add(cg,"math__acosh",    tf,NULL,p1f,   NULL,1);
+        func_sig_add(cg,"math__atanh",    tf,NULL,p1f,   NULL,1);
+        func_sig_add(cg,"math__degrees",  tf,NULL,p1f,   NULL,1);
+        func_sig_add(cg,"math__radians",  tf,NULL,p1f,   NULL,1);
+        func_sig_add(cg,"math__erf",      tf,NULL,p1f,   NULL,1);
+        func_sig_add(cg,"math__erfc",     tf,NULL,p1f,   NULL,1);
+        func_sig_add(cg,"math__lgamma",   tf,NULL,p1f,   NULL,1);
+        func_sig_add(cg,"math__gamma",    tf,NULL,p1f,   NULL,1);
+        /* (adad) → adad */
+        func_sig_add(cg,"math__iabs",     ti,NULL,p1i,   NULL,1);
+        func_sig_add(cg,"math__isqrt",    ti,NULL,p1i,   NULL,1);
+        func_sig_add(cg,"math__factorial",ti,NULL,p1i,   NULL,1);
+        /* (adad, adad) → adad */
+        func_sig_add(cg,"math__min",      ti,NULL,p2ii,  NULL,2);
+        func_sig_add(cg,"math__max",      ti,NULL,p2ii,  NULL,2);
+        func_sig_add(cg,"math__gcd",      ti,NULL,p2ii,  NULL,2);
+        func_sig_add(cg,"math__lcm",      ti,NULL,p2ii,  NULL,2);
+        func_sig_add(cg,"math__comb",     ti,NULL,p2ii,  NULL,2);
+        func_sig_add(cg,"math__perm",     ti,NULL,p2ii,  NULL,2);
+        /* (adad, adad, adad) → adad */
+        func_sig_add(cg,"math__clamp",    ti,NULL,p3iii, NULL,3);
+        /* (f64, f64) → f64 */
+        func_sig_add(cg,"math__minf",     tf,NULL,p2ff,  NULL,2);
+        func_sig_add(cg,"math__maxf",     tf,NULL,p2ff,  NULL,2);
+        func_sig_add(cg,"math__hypot",    tf,NULL,p2ff,  NULL,2);
+        func_sig_add(cg,"math__fmod",     tf,NULL,p2ff,  NULL,2);
+        func_sig_add(cg,"math__remainder",tf,NULL,p2ff,  NULL,2);
+        func_sig_add(cg,"math__copysign", tf,NULL,p2ff,  NULL,2);
+        func_sig_add(cg,"math__nextafter",tf,NULL,p2ff,  NULL,2);
+        func_sig_add(cg,"math__isclose",  TYPE_BOOL,NULL,p2ff,NULL,2);
+        /* (f64, adad) → f64 */
+        func_sig_add(cg,"math__pow",      tf,NULL,p2fi,  NULL,2);
+        func_sig_add(cg,"math__ldexp",    tf,NULL,p2fi,  NULL,2);
+        /* (f64, f64, f64, f64) → f64 */
+        func_sig_add(cg,"math__dist",     tf,NULL,p4ffff,NULL,4);
+        /* bool predicates */
+        func_sig_add(cg,"math__isnan",    TYPE_BOOL,NULL,p1f,NULL,1);
+        func_sig_add(cg,"math__isinf",    TYPE_BOOL,NULL,p1f,NULL,1);
+        func_sig_add(cg,"math__isfinite", TYPE_BOOL,NULL,p1f,NULL,1);
+        /* (f64) → (f64, f64) tuples */
+        func_sig_add(cg,"math__modf",     TYPE_TUPLE,NULL,p1f,NULL,1);
+        func_sig_add(cg,"math__frexp",    TYPE_TUPLE,NULL,p1f,NULL,1);
+        /* (f64, f64) → bool */
+        func_sig_add(cg,"math__atan2",    tf,NULL,p2ff,  NULL,2);
+        func_sig_add(cg,"math__ulp",      tf,NULL,p1f,   NULL,1);
+        /* [f64] → f64 */
+        { ValueType p1arr[1]={TYPE_ARRAY};
+          ValueType p2arr[2]={TYPE_ARRAY,TYPE_ARRAY};
+          func_sig_add(cg,"math__fsum",    tf,NULL,p1arr, NULL,1);
+          func_sig_add(cg,"math__prod",    tf,NULL,p1arr, NULL,1);
+          /* ([f64], [f64]) → f64 */
+          func_sig_add(cg,"math__sumprod", tf,NULL,p2arr, NULL,2); }
+        /* (f64, f64, f64, f64) → bool */
+        func_sig_add(cg,"math__isclose_tol", TYPE_BOOL, NULL,p4ffff, NULL,4);
+    } else if (strcmp(mod, "raylib") == 0) {
+        /* ---- type shorthands ---- */
+        ValueType p1i[1]={ti}, p1s[1]={ts}, p1f[1]={tf};
+        ValueType p2ii[2]={ti,ti}, p2si[2]={ts,ti};
+        ValueType p2ff[2]={tf,tf};
+        ValueType p3iii[3]={ti,ti,ti};
+        ValueType p3ffi[3]={tf,tf,ti};
+        ValueType p3fff[3]={tf,tf,tf};
+        ValueType p4iiii[4]={ti,ti,ti,ti};
+        ValueType p4ffff[4]={tf,tf,tf,tf};
+        ValueType p5iiiii[5]={ti,ti,ti,ti,ti};
+        ValueType p5ffffi[5]={tf,tf,tf,tf,ti};
+        ValueType p6ffffff[6]={tf,tf,tf,tf,tf,tf};
+        ValueType p7ffffffi[7]={tf,tf,tf,tf,tf,tf,ti};
+
+        /* ---- WINDOW ---- */
+        func_sig_add(cg,"raylib__init_window",              TYPE_VOID,NULL,(ValueType[]){ti,ti,ts},NULL,3);
+        func_sig_add(cg,"raylib__close_window",             TYPE_VOID,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__window_should_close",      ti,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__is_window_ready",          ti,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__is_window_fullscreen",     ti,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__is_window_hidden",         ti,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__is_window_minimized",      ti,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__is_window_maximized",      ti,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__is_window_focused",        ti,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__is_window_resized",        ti,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__set_window_state",         TYPE_VOID,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__clear_window_state",       TYPE_VOID,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__toggle_fullscreen",        TYPE_VOID,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__toggle_borderless_windowed",TYPE_VOID,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__maximize_window",          TYPE_VOID,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__minimize_window",          TYPE_VOID,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__restore_window",           TYPE_VOID,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__set_window_title",         TYPE_VOID,NULL,p1s,NULL,1);
+        func_sig_add(cg,"raylib__set_window_position",      TYPE_VOID,NULL,p2ii,NULL,2);
+        func_sig_add(cg,"raylib__set_window_monitor",       TYPE_VOID,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__set_window_min_size",      TYPE_VOID,NULL,p2ii,NULL,2);
+        func_sig_add(cg,"raylib__set_window_max_size",      TYPE_VOID,NULL,p2ii,NULL,2);
+        func_sig_add(cg,"raylib__set_window_size",          TYPE_VOID,NULL,p2ii,NULL,2);
+        func_sig_add(cg,"raylib__set_window_opacity",       TYPE_VOID,NULL,p1f,NULL,1);
+        func_sig_add(cg,"raylib__set_window_focused",       TYPE_VOID,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__get_screen_width",         ti,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__get_screen_height",        ti,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__get_render_width",         ti,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__get_render_height",        ti,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__get_monitor_count",        ti,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__get_current_monitor",      ti,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__get_monitor_width",        ti,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__get_monitor_height",       ti,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__get_monitor_refresh_rate", ti,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__get_monitor_name",         ts,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__set_clipboard_text",       TYPE_VOID,NULL,p1s,NULL,1);
+        func_sig_add(cg,"raylib__get_clipboard_text",       ts,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__enable_event_waiting",     TYPE_VOID,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__disable_event_waiting",    TYPE_VOID,NULL,NULL,NULL,0);
+
+        /* ---- TIMING ---- */
+        func_sig_add(cg,"raylib__set_target_fps",   TYPE_VOID,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__get_fps",          ti,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__get_frame_time",   tf,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__get_time",         tf,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__wait_time",        TYPE_VOID,NULL,p1f,NULL,1);
+
+        /* ---- CONFIG ---- */
+        func_sig_add(cg,"raylib__set_config_flags",   TYPE_VOID,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__set_trace_log_level",TYPE_VOID,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__set_exit_key",       TYPE_VOID,NULL,p1i,NULL,1);
+
+        /* ---- DRAWING PIPELINE ---- */
+        func_sig_add(cg,"raylib__clear_background",   TYPE_VOID,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__begin_drawing",      TYPE_VOID,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__end_drawing",        TYPE_VOID,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__begin_mode2d",       TYPE_VOID,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__end_mode2d",         TYPE_VOID,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__begin_mode3d",       TYPE_VOID,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__end_mode3d",         TYPE_VOID,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__begin_texture_mode", TYPE_VOID,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__end_texture_mode",   TYPE_VOID,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__begin_shader_mode",  TYPE_VOID,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__end_shader_mode",    TYPE_VOID,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__begin_blend_mode",   TYPE_VOID,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__end_blend_mode",     TYPE_VOID,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__begin_scissor_mode", TYPE_VOID,NULL,p4iiii,NULL,4);
+        func_sig_add(cg,"raylib__end_scissor_mode",   TYPE_VOID,NULL,NULL,NULL,0);
+
+        /* ---- 2D SHAPES ---- */
+        func_sig_add(cg,"raylib__draw_pixel",              TYPE_VOID,NULL,p3iii,NULL,3);
+        func_sig_add(cg,"raylib__draw_line",               TYPE_VOID,NULL,p5iiiii,NULL,5);
+        func_sig_add(cg,"raylib__draw_line_ex",            TYPE_VOID,NULL,(ValueType[]){tf,tf,tf,tf,tf,ti},NULL,6);
+        func_sig_add(cg,"raylib__draw_line_bezier",        TYPE_VOID,NULL,(ValueType[]){tf,tf,tf,tf,tf,ti},NULL,6);
+        func_sig_add(cg,"raylib__draw_circle",             TYPE_VOID,NULL,(ValueType[]){ti,ti,tf,ti},NULL,4);
+        func_sig_add(cg,"raylib__draw_circle_sector",      TYPE_VOID,NULL,(ValueType[]){tf,tf,tf,tf,tf,ti,ti},NULL,7);
+        func_sig_add(cg,"raylib__draw_circle_sector_lines",TYPE_VOID,NULL,(ValueType[]){tf,tf,tf,tf,tf,ti,ti},NULL,7);
+        func_sig_add(cg,"raylib__draw_circle_gradient",    TYPE_VOID,NULL,(ValueType[]){ti,ti,tf,ti,ti},NULL,5);
+        func_sig_add(cg,"raylib__draw_circle_lines",       TYPE_VOID,NULL,(ValueType[]){ti,ti,tf,ti},NULL,4);
+        func_sig_add(cg,"raylib__draw_ellipse",            TYPE_VOID,NULL,(ValueType[]){ti,ti,tf,tf,ti},NULL,5);
+        func_sig_add(cg,"raylib__draw_ellipse_lines",      TYPE_VOID,NULL,(ValueType[]){ti,ti,tf,tf,ti},NULL,5);
+        func_sig_add(cg,"raylib__draw_ring",               TYPE_VOID,NULL,(ValueType[]){tf,tf,tf,tf,tf,tf,ti,ti},NULL,8);
+        func_sig_add(cg,"raylib__draw_ring_lines",         TYPE_VOID,NULL,(ValueType[]){tf,tf,tf,tf,tf,tf,ti,ti},NULL,8);
+        func_sig_add(cg,"raylib__draw_rectangle",          TYPE_VOID,NULL,p5iiiii,NULL,5);
+        func_sig_add(cg,"raylib__draw_rectangle_gradient_v",TYPE_VOID,NULL,(ValueType[]){ti,ti,ti,ti,ti,ti},NULL,6);
+        func_sig_add(cg,"raylib__draw_rectangle_gradient_h",TYPE_VOID,NULL,(ValueType[]){ti,ti,ti,ti,ti,ti},NULL,6);
+        func_sig_add(cg,"raylib__draw_rectangle_lines",    TYPE_VOID,NULL,p5iiiii,NULL,5);
+        func_sig_add(cg,"raylib__draw_rectangle_rounded",  TYPE_VOID,NULL,(ValueType[]){tf,tf,tf,tf,tf,ti,ti},NULL,7);
+        func_sig_add(cg,"raylib__draw_rectangle_rounded_lines",TYPE_VOID,NULL,(ValueType[]){tf,tf,tf,tf,tf,ti,ti},NULL,7);
+        func_sig_add(cg,"raylib__draw_triangle",           TYPE_VOID,NULL,(ValueType[]){tf,tf,tf,tf,tf,tf,ti},NULL,7);
+        func_sig_add(cg,"raylib__draw_triangle_lines",     TYPE_VOID,NULL,(ValueType[]){tf,tf,tf,tf,tf,tf,ti},NULL,7);
+        func_sig_add(cg,"raylib__draw_poly",               TYPE_VOID,NULL,(ValueType[]){tf,tf,ti,tf,tf,ti},NULL,6);
+        func_sig_add(cg,"raylib__draw_poly_lines",         TYPE_VOID,NULL,(ValueType[]){tf,tf,ti,tf,tf,ti},NULL,6);
+
+        /* ---- COLLISION 2D ---- */
+        func_sig_add(cg,"raylib__check_collision_recs",          ti,NULL,(ValueType[]){ti,ti,ti,ti,ti,ti,ti,ti},NULL,8);
+        func_sig_add(cg,"raylib__check_collision_circles",       ti,NULL,(ValueType[]){tf,tf,tf,tf,tf,tf},NULL,6);
+        func_sig_add(cg,"raylib__check_collision_point_rec",     ti,NULL,(ValueType[]){tf,tf,ti,ti,ti,ti},NULL,6);
+        func_sig_add(cg,"raylib__check_collision_point_circle",  ti,NULL,(ValueType[]){tf,tf,tf,tf,tf},NULL,5);
+
+        /* ---- TEXT ---- */
+        func_sig_add(cg,"raylib__draw_fps",       TYPE_VOID,NULL,p2ii,NULL,2);
+        func_sig_add(cg,"raylib__draw_text",      TYPE_VOID,NULL,(ValueType[]){ts,ti,ti,ti,ti},NULL,5);
+        func_sig_add(cg,"raylib__draw_text_ex",   TYPE_VOID,NULL,(ValueType[]){ti,ts,tf,tf,tf,tf,ti},NULL,7);
+        func_sig_add(cg,"raylib__measure_text",   ti,NULL,p2si,NULL,2);
+        func_sig_add(cg,"raylib__load_font",      ti,NULL,p1s,NULL,1);
+        func_sig_add(cg,"raylib__load_font_ex",   ti,NULL,(ValueType[]){ts,ti,ti,ti},NULL,4);
+        func_sig_add(cg,"raylib__unload_font",    TYPE_VOID,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__get_font_default",ti,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__set_text_line_spacing",TYPE_VOID,NULL,p1i,NULL,1);
+
+        /* ---- TEXTURES ---- */
+        func_sig_add(cg,"raylib__load_texture",            ti,NULL,p1s,NULL,1);
+        func_sig_add(cg,"raylib__load_texture_from_image", ti,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__load_render_texture",     ti,NULL,p2ii,NULL,2);
+        func_sig_add(cg,"raylib__is_texture_ready",        ti,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__unload_texture",          TYPE_VOID,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__unload_render_texture",   TYPE_VOID,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__draw_texture",            TYPE_VOID,NULL,p4iiii,NULL,4);
+        func_sig_add(cg,"raylib__draw_texture_ex",         TYPE_VOID,NULL,(ValueType[]){ti,tf,tf,tf,tf,ti},NULL,6);
+        func_sig_add(cg,"raylib__draw_texture_rec",        TYPE_VOID,NULL,(ValueType[]){ti,tf,tf,tf,tf,tf,tf,ti},NULL,8);
+        func_sig_add(cg,"raylib__set_texture_filter",      TYPE_VOID,NULL,p2ii,NULL,2);
+        func_sig_add(cg,"raylib__set_texture_wrap",        TYPE_VOID,NULL,p2ii,NULL,2);
+        func_sig_add(cg,"raylib__gen_texture_mipmaps",     TYPE_VOID,NULL,p1i,NULL,1);
+
+        /* ---- IMAGES ---- */
+        func_sig_add(cg,"raylib__load_image",             ti,NULL,p1s,NULL,1);
+        func_sig_add(cg,"raylib__is_image_ready",         ti,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__unload_image",           TYPE_VOID,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__export_image",           ti,NULL,(ValueType[]){ti,ts},NULL,2);
+        func_sig_add(cg,"raylib__gen_image_color",        ti,NULL,p3iii,NULL,3);
+        func_sig_add(cg,"raylib__gen_image_gradient_linear",ti,NULL,(ValueType[]){ti,ti,ti,ti,ti},NULL,5);
+        func_sig_add(cg,"raylib__gen_image_gradient_radial",ti,NULL,(ValueType[]){ti,ti,tf,ti,ti},NULL,5);
+        func_sig_add(cg,"raylib__gen_image_checked",      ti,NULL,(ValueType[]){ti,ti,ti,ti,ti,ti},NULL,6);
+        func_sig_add(cg,"raylib__gen_image_white_noise",  ti,NULL,(ValueType[]){ti,ti,tf},NULL,3);
+        func_sig_add(cg,"raylib__image_resize",           TYPE_VOID,NULL,p3iii,NULL,3);
+        func_sig_add(cg,"raylib__image_flip_vertical",    TYPE_VOID,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__image_flip_horizontal",  TYPE_VOID,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__image_rotate_cw",        TYPE_VOID,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__image_rotate_ccw",       TYPE_VOID,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__image_color_tint",       TYPE_VOID,NULL,p2ii,NULL,2);
+        func_sig_add(cg,"raylib__image_color_invert",     TYPE_VOID,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__image_color_grayscale",  TYPE_VOID,NULL,p1i,NULL,1);
+
+        /* ---- COLORS ---- */
+        func_sig_add(cg,"raylib__color_rgba",        ti,NULL,p4iiii,NULL,4);
+        func_sig_add(cg,"raylib__fade",              ti,NULL,(ValueType[]){ti,tf},NULL,2);
+        func_sig_add(cg,"raylib__color_to_int",      ti,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__color_tint",        ti,NULL,p2ii,NULL,2);
+        func_sig_add(cg,"raylib__color_brightness",  ti,NULL,(ValueType[]){ti,tf},NULL,2);
+        func_sig_add(cg,"raylib__color_contrast",    ti,NULL,(ValueType[]){ti,tf},NULL,2);
+        func_sig_add(cg,"raylib__color_alpha",       ti,NULL,(ValueType[]){ti,tf},NULL,2);
+        func_sig_add(cg,"raylib__color_alpha_blend", ti,NULL,p3iii,NULL,3);
+        func_sig_add(cg,"raylib__get_color",         ti,NULL,p1i,NULL,1);
+        /* color presets — no args */
+        const char *color_presets[] = {
+            "black","white","red","green","blue","yellow","orange","purple",
+            "magenta","gray","darkgray","lightgray","skyblue","lime","gold",
+            "pink","maroon","beige","brown","darkbrown","darkblue","darkgreen",
+            "darkpurple","violet","transparent", NULL
+        };
+        for (int ci = 0; color_presets[ci]; ci++) {
+            char cpname[MAX_TOKEN_LEN*2+4];
+            snprintf(cpname, sizeof(cpname), "raylib__color_%s", color_presets[ci]);
+            func_sig_add(cg, cpname, ti, NULL, NULL, NULL, 0);
+        }
+
+        /* ---- 3D DRAWING ---- */
+        func_sig_add(cg,"raylib__draw_line3d",        TYPE_VOID,NULL,(ValueType[]){tf,tf,tf,tf,tf,tf,ti},NULL,7);
+        func_sig_add(cg,"raylib__draw_point3d",       TYPE_VOID,NULL,(ValueType[]){tf,tf,tf,ti},NULL,4);
+        func_sig_add(cg,"raylib__draw_circle3d",      TYPE_VOID,NULL,(ValueType[]){tf,tf,tf,tf,tf,tf,tf,tf,ti},NULL,9);
+        func_sig_add(cg,"raylib__draw_cube",          TYPE_VOID,NULL,(ValueType[]){tf,tf,tf,tf,tf,tf,ti},NULL,7);
+        func_sig_add(cg,"raylib__draw_cube_wires",    TYPE_VOID,NULL,(ValueType[]){tf,tf,tf,tf,tf,tf,ti},NULL,7);
+        func_sig_add(cg,"raylib__draw_sphere",        TYPE_VOID,NULL,(ValueType[]){tf,tf,tf,tf,ti},NULL,5);
+        func_sig_add(cg,"raylib__draw_sphere_ex",     TYPE_VOID,NULL,(ValueType[]){tf,tf,tf,tf,ti,ti,ti},NULL,7);
+        func_sig_add(cg,"raylib__draw_sphere_wires",  TYPE_VOID,NULL,(ValueType[]){tf,tf,tf,tf,ti,ti,ti},NULL,7);
+        func_sig_add(cg,"raylib__draw_cylinder",      TYPE_VOID,NULL,(ValueType[]){tf,tf,tf,tf,tf,tf,ti,ti},NULL,8);
+        func_sig_add(cg,"raylib__draw_cylinder_ex",   TYPE_VOID,NULL,(ValueType[]){tf,tf,tf,tf,tf,tf,tf,tf,ti,ti},NULL,10);
+        func_sig_add(cg,"raylib__draw_cylinder_wires",TYPE_VOID,NULL,(ValueType[]){tf,tf,tf,tf,tf,tf,ti,ti},NULL,8);
+        func_sig_add(cg,"raylib__draw_capsule",       TYPE_VOID,NULL,(ValueType[]){tf,tf,tf,tf,tf,tf,tf,ti,ti,ti},NULL,10);
+        func_sig_add(cg,"raylib__draw_capsule_wires", TYPE_VOID,NULL,(ValueType[]){tf,tf,tf,tf,tf,tf,tf,ti,ti,ti},NULL,10);
+        func_sig_add(cg,"raylib__draw_plane",         TYPE_VOID,NULL,(ValueType[]){tf,tf,tf,tf,tf,ti},NULL,6);
+        func_sig_add(cg,"raylib__draw_grid",          TYPE_VOID,NULL,(ValueType[]){ti,tf},NULL,2);
+        func_sig_add(cg,"raylib__draw_bounding_box",  TYPE_VOID,NULL,(ValueType[]){tf,tf,tf,tf,tf,tf,ti},NULL,7);
+
+        /* ---- MODEL / MESH ---- */
+        func_sig_add(cg,"raylib__load_model",            ti,NULL,p1s,NULL,1);
+        func_sig_add(cg,"raylib__is_model_ready",        ti,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__unload_model",          TYPE_VOID,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__draw_model",            TYPE_VOID,NULL,(ValueType[]){ti,tf,tf,tf,tf,ti},NULL,6);
+        func_sig_add(cg,"raylib__draw_model_ex",         TYPE_VOID,NULL,(ValueType[]){ti,tf,tf,tf,tf,tf,tf,tf,tf,tf,tf,ti},NULL,12);
+        func_sig_add(cg,"raylib__draw_model_wires",      TYPE_VOID,NULL,(ValueType[]){ti,tf,tf,tf,tf,ti},NULL,6);
+        func_sig_add(cg,"raylib__draw_billboard",        TYPE_VOID,NULL,(ValueType[]){ti,ti,tf,tf,tf,tf,ti},NULL,7);
+        func_sig_add(cg,"raylib__unload_mesh",           TYPE_VOID,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__draw_mesh",             TYPE_VOID,NULL,p3iii,NULL,3);
+        func_sig_add(cg,"raylib__gen_mesh_cube",         ti,NULL,p3fff,NULL,3);
+        func_sig_add(cg,"raylib__gen_mesh_sphere",       ti,NULL,(ValueType[]){tf,ti,ti},NULL,3);
+        func_sig_add(cg,"raylib__gen_mesh_cylinder",     ti,NULL,(ValueType[]){tf,tf,ti},NULL,3);
+        func_sig_add(cg,"raylib__gen_mesh_cone",         ti,NULL,(ValueType[]){tf,tf,ti},NULL,3);
+        func_sig_add(cg,"raylib__gen_mesh_torus",        ti,NULL,(ValueType[]){tf,tf,ti,ti},NULL,4);
+        func_sig_add(cg,"raylib__gen_mesh_plane",        ti,NULL,(ValueType[]){tf,tf,ti,ti},NULL,4);
+        func_sig_add(cg,"raylib__load_material_default", ti,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__unload_material",       TYPE_VOID,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__set_material_texture",  TYPE_VOID,NULL,p3iii,NULL,3);
+        func_sig_add(cg,"raylib__update_model_animation",TYPE_VOID,NULL,p3iii,NULL,3);
+        func_sig_add(cg,"raylib__unload_model_animation",TYPE_VOID,NULL,p1i,NULL,1);
+
+        /* ---- CAMERA ---- */
+        func_sig_add(cg,"raylib__update_camera",     TYPE_VOID,NULL,p2ii,NULL,2);
+
+        /* ---- SHADERS ---- */
+        func_sig_add(cg,"raylib__load_shader",             ti,NULL,(ValueType[]){ts,ts},NULL,2);
+        func_sig_add(cg,"raylib__load_shader_from_memory", ti,NULL,(ValueType[]){ts,ts},NULL,2);
+        func_sig_add(cg,"raylib__is_shader_ready",         ti,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__unload_shader",           TYPE_VOID,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__get_shader_location",     ti,NULL,(ValueType[]){ti,ts},NULL,2);
+        func_sig_add(cg,"raylib__set_shader_value",        TYPE_VOID,NULL,p4iiii,NULL,4);
+        func_sig_add(cg,"raylib__set_shader_value_texture",TYPE_VOID,NULL,p3iii,NULL,3);
+
+        /* ---- COLLISION 3D ---- */
+        func_sig_add(cg,"raylib__check_collision_spheres",    ti,NULL,(ValueType[]){tf,tf,tf,tf,tf,tf},NULL,6);
+        func_sig_add(cg,"raylib__check_collision_boxes",      ti,NULL,(ValueType[]){tf,tf,tf,tf,tf,tf,tf,tf,tf,tf,tf,tf},NULL,12);
+        func_sig_add(cg,"raylib__check_collision_box_sphere", ti,NULL,(ValueType[]){tf,tf,tf,tf,tf,tf,tf,tf,tf},NULL,9);
+        func_sig_add(cg,"raylib__get_ray_collision_sphere",   ti,NULL,(ValueType[]){tf,tf,tf,tf,tf,tf,tf},NULL,7);
+        func_sig_add(cg,"raylib__get_ray_collision_box",      ti,NULL,(ValueType[]){tf,tf,tf,tf,tf,tf,tf,tf,tf},NULL,9);
+
+        /* ---- INPUT: KEYBOARD ---- */
+        func_sig_add(cg,"raylib__is_key_pressed",        ti,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__is_key_pressed_repeat", ti,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__is_key_down",           ti,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__is_key_released",       ti,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__is_key_up",             ti,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__get_key_pressed",       ti,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__get_char_pressed",      ti,NULL,NULL,NULL,0);
+
+        /* ---- INPUT: MOUSE ---- */
+        func_sig_add(cg,"raylib__is_mouse_button_pressed",  ti,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__is_mouse_button_down",     ti,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__is_mouse_button_released", ti,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__is_mouse_button_up",       ti,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__get_mouse_x",              ti,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__get_mouse_y",              ti,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__get_mouse_wheel",          tf,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__set_mouse_position",       TYPE_VOID,NULL,p2ii,NULL,2);
+        func_sig_add(cg,"raylib__set_mouse_offset",         TYPE_VOID,NULL,p2ii,NULL,2);
+        func_sig_add(cg,"raylib__set_mouse_scale",          TYPE_VOID,NULL,p2ff,NULL,2);
+        func_sig_add(cg,"raylib__set_mouse_cursor",         TYPE_VOID,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__get_touch_x",              ti,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__get_touch_y",              ti,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__get_touch_point_count",    ti,NULL,NULL,NULL,0);
+
+        /* ---- INPUT: GAMEPAD ---- */
+        func_sig_add(cg,"raylib__is_gamepad_available",       ti,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__is_gamepad_button_pressed",  ti,NULL,p2ii,NULL,2);
+        func_sig_add(cg,"raylib__is_gamepad_button_down",     ti,NULL,p2ii,NULL,2);
+        func_sig_add(cg,"raylib__is_gamepad_button_released", ti,NULL,p2ii,NULL,2);
+        func_sig_add(cg,"raylib__is_gamepad_button_up",       ti,NULL,p2ii,NULL,2);
+        func_sig_add(cg,"raylib__get_gamepad_button_pressed", ti,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__get_gamepad_axis_count",     ti,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__get_gamepad_axis_movement",  tf,NULL,p2ii,NULL,2);
+
+        /* ---- AUDIO ---- */
+        func_sig_add(cg,"raylib__init_audio",           TYPE_VOID,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__close_audio",          TYPE_VOID,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__is_audio_device_ready",ti,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__set_master_volume",    TYPE_VOID,NULL,p1f,NULL,1);
+        func_sig_add(cg,"raylib__get_master_volume",    tf,NULL,NULL,NULL,0);
+        func_sig_add(cg,"raylib__load_sound",           ti,NULL,p1s,NULL,1);
+        func_sig_add(cg,"raylib__is_sound_ready",       ti,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__unload_sound",         TYPE_VOID,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__play_sound",           TYPE_VOID,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__stop_sound",           TYPE_VOID,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__pause_sound",          TYPE_VOID,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__resume_sound",         TYPE_VOID,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__is_sound_playing",     ti,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__set_sound_volume",     TYPE_VOID,NULL,(ValueType[]){ti,tf},NULL,2);
+        func_sig_add(cg,"raylib__set_sound_pitch",      TYPE_VOID,NULL,(ValueType[]){ti,tf},NULL,2);
+        func_sig_add(cg,"raylib__set_sound_pan",        TYPE_VOID,NULL,(ValueType[]){ti,tf},NULL,2);
+        func_sig_add(cg,"raylib__load_music_stream",    ti,NULL,p1s,NULL,1);
+        func_sig_add(cg,"raylib__is_music_ready",       ti,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__unload_music_stream",  TYPE_VOID,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__play_music_stream",    TYPE_VOID,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__is_music_stream_playing",ti,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__update_music_stream",  TYPE_VOID,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__stop_music_stream",    TYPE_VOID,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__pause_music_stream",   TYPE_VOID,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__resume_music_stream",  TYPE_VOID,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__seek_music_stream",    TYPE_VOID,NULL,(ValueType[]){ti,tf},NULL,2);
+        func_sig_add(cg,"raylib__set_music_volume",     TYPE_VOID,NULL,(ValueType[]){ti,tf},NULL,2);
+        func_sig_add(cg,"raylib__set_music_pitch",      TYPE_VOID,NULL,(ValueType[]){ti,tf},NULL,2);
+        func_sig_add(cg,"raylib__set_music_pan",        TYPE_VOID,NULL,(ValueType[]){ti,tf},NULL,2);
+        func_sig_add(cg,"raylib__get_music_time_length",tf,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__get_music_time_played",tf,NULL,p1i,NULL,1);
+
+        /* ---- UTILITY ---- */
+        func_sig_add(cg,"raylib__get_random_value", ti,NULL,p2ii,NULL,2);
+        func_sig_add(cg,"raylib__set_random_seed",  TYPE_VOID,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__take_screenshot",  TYPE_VOID,NULL,p1s,NULL,1);
+        func_sig_add(cg,"raylib__open_url",         TYPE_VOID,NULL,p1s,NULL,1);
+        /* ---- WAVE / AUDIO STREAMING ---- */
+        func_sig_add(cg,"raylib__load_wave",           ti,       NULL,p1s,NULL,1);
+        func_sig_add(cg,"raylib__is_wave_ready",       ti,       NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__unload_wave",         TYPE_VOID,NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__load_sound_from_wave",ti,       NULL,p1i,NULL,1);
+        func_sig_add(cg,"raylib__export_wave",         ti,       NULL,(ValueType[]){ti,ts},NULL,2);
+        func_sig_add(cg,"raylib__update_sound",        TYPE_VOID,NULL,(ValueType[]){ti,ti,ti},NULL,3);
+        /* ---- GAMEPAD ADVANCED ---- */
+        func_sig_add(cg,"raylib__set_gamepad_vibration",TYPE_VOID,NULL,(ValueType[]){ti,tf,tf,tf},NULL,4);
+        /* ---- CAMERA ---- */
+        func_sig_add(cg,"raylib__update_camera_pro",  TYPE_VOID,NULL,(ValueType[]){ti,ti,ti,tf},NULL,4);
+        /* ---- TEXT RENDERING ---- */
+        func_sig_add(cg,"raylib__get_glyph_index",    ti,       NULL,p2ii,NULL,2);
+        func_sig_add(cg,"raylib__measure_text_ex",    ti,       NULL,(ValueType[]){ti,ts,tf,tf},NULL,4);
     }
 }
 
@@ -542,12 +1371,12 @@ int codegen_find_var(CodeGen *cg, const char *name) {
 
 void codegen_add_var(CodeGen *cg, const char *name, ValueType type,
                      bool is_mut, TypeInfo *tinfo) {
-    if (cg->var_count >= MAX_VARS) error("Too many local variables");
+    if (cg->var_count >= MAX_VARS) error(ERR_FATAL, "Too many local variables");
     int size = typeinfo_size(cg, type, tinfo);
     if (size < 8) size = 8;
     cg->stack_offset += size;
     if (cg->stack_offset > LOCAL_STACK_RESERVE)
-        error("Local stack limit exceeded (%d bytes). "
+        error(ERR_FATAL, "Local stack limit exceeded (%d bytes). "
               "Increase LOCAL_STACK_RESERVE or use fewer/smaller locals.",
               LOCAL_STACK_RESERVE);
     int idx = cg->var_count++;
@@ -568,7 +1397,7 @@ static int  mod_func_count = 0;
 static void mod_func_table_clear(void) { mod_func_count = 0; }
 static void mod_func_table_add(const char *n) {
     if (mod_func_count < MAX_MOD_FUNCS)
-        strncpy(mod_func_table[mod_func_count++], n, MAX_TOKEN_LEN-1);
+        vl_strncpy(mod_func_table[mod_func_count++], n, MAX_TOKEN_LEN);
 }
 static bool mod_func_table_has(const char *n) {
     for (int i = 0; i < mod_func_count; i++)
@@ -582,6 +1411,10 @@ static bool mod_func_table_has(const char *n) {
 static TypeInfo* expr_typeinfo(CodeGen *cg, ASTNode *expr) {
     if (!expr) return NULL;
     switch (expr->type) {
+    case AST_UNARY_OP:
+        if (expr->data.unary.op == UOP_ADDR)
+            return expr_typeinfo(cg, expr->data.unary.operand);
+        return NULL;
     case AST_IDENTIFIER: {
         int idx = codegen_find_var(cg, expr->data.identifier);
         return idx >= 0 ? cg->var_typeinfo[idx] : NULL;
@@ -604,6 +1437,17 @@ static TypeInfo* expr_typeinfo(CodeGen *cg, ASTNode *expr) {
     }
     case AST_CALL: {
         const char *fn = expr->data.call.func_name;
+        ASTNode *tmpl = find_generic_template(fn);
+        if (tmpl) {
+            char generic_name[MAX_TOKEN_LEN * 3];
+            if (queue_generic_instantiation(cg, tmpl,
+                                            expr->data.call.args,
+                                            expr->data.call.arg_count,
+                                            generic_name, sizeof(generic_name))) {
+                FunctionSig *gsig = func_sig_find(cg, generic_name);
+                return gsig ? gsig->return_typeinfo : NULL;
+            }
+        }
         char mangled[MAX_TOKEN_LEN*2+4];
         if (cg->current_module[0] && mod_func_table_has(fn)) {
             make_module_symbol(mangled, sizeof(mangled), cg->current_module, fn);
@@ -614,9 +1458,12 @@ static TypeInfo* expr_typeinfo(CodeGen *cg, ASTNode *expr) {
     }
     case AST_MODULE_CALL: {
         char full[MAX_TOKEN_LEN*2+4];
+        const char *mod = expr->data.module_call.module_name;
+        const char *fn  = expr->data.module_call.func_name;
+        if (strcmp(mod, "io") == 0 && strcmp(fn, "chhaapln") == 0)
+            fn = "chhaapLine";
         snprintf(full, sizeof(full), "%s__%s",
-                 expr->data.module_call.module_name,
-                 expr->data.module_call.func_name);
+                 mod, fn);
         FunctionSig *sig = func_sig_find(cg, full);
         return sig ? sig->return_typeinfo : NULL;
     }
@@ -663,69 +1510,90 @@ static ValueType infer_expr_type(CodeGen *cg, ASTNode *expr) {
     }
     case AST_IDENTIFIER: {
         int idx = codegen_find_var(cg, expr->data.identifier);
-        if (idx < 0) error_at(expr->line, expr->column,
+        if (idx < 0) error_at(ERR_TYPE, expr->line, expr->column,
                                "undefined variable '%s'", expr->data.identifier);
         return cg->var_types[idx];
     }
     case AST_ARRAY_ACCESS: {
         ASTNode *base = expr->data.array_access.array;
         if (base->type != AST_IDENTIFIER)
-            error_at(expr->line, expr->column, "array access needs identifier base");
+            error_at(ERR_TYPE, expr->line, expr->column, "array access needs identifier base");
         int idx = codegen_find_var(cg, base->data.identifier);
-        if (idx < 0) error_at(expr->line, expr->column,
+        if (idx < 0) error_at(ERR_TYPE, expr->line, expr->column,
                                "undefined variable '%s'", base->data.identifier);
         if (cg->var_types[idx] != TYPE_ARRAY)
-            error_at(expr->line, expr->column,
+            error_at(ERR_TYPE, expr->line, expr->column,
                      "'%s' is not an array", base->data.identifier);
         TypeInfo *ti = cg->var_typeinfo[idx];
         return ti ? ti->elem_type : TYPE_INT;
     }
     case AST_FIELD_ACCESS: {
         TypeInfo *bti = expr_typeinfo(cg, expr->data.field_access.base);
-        if (!bti) error_at(expr->line, expr->column, "field access on non-struct");
+        if (!bti) error_at(ERR_TYPE, expr->line, expr->column, "field access on non-struct");
         StructDef *sd = struct_find(cg, bti->struct_name);
-        if (!sd) error_at(expr->line, expr->column,
+        if (!sd) error_at(ERR_TYPE, expr->line, expr->column,
                            "unknown struct '%s'", bti->struct_name);
         int fidx = struct_field_index(sd, expr->data.field_access.field_name);
-        if (fidx < 0) error_at(expr->line, expr->column,
+        if (fidx < 0) error_at(ERR_TYPE, expr->line, expr->column,
                                 "unknown field '%s' on '%s'",
                                 expr->data.field_access.field_name, sd->name);
-        return sd->field_types[fidx];
+        ValueType ft = sd->field_types[fidx];
+        TypeInfo *fti = sd->field_typeinfo ? sd->field_typeinfo[fidx] : NULL;
+        if (is_generic_struct_slot(ft, fti)) return TYPE_INT;
+        return ft;
     }
     case AST_BINARY_OP: {
         BinaryOp op = expr->data.binary.op;
         if (op==OP_EQ||op==OP_NE||op==OP_LT||op==OP_LE||op==OP_GT||op==OP_GE||
             op==OP_AND||op==OP_OR||op==OP_NOT)
             return TYPE_BOOL;
+        if (op==OP_COALESCE)
+            return infer_expr_type(cg, expr->data.binary.right);
         ValueType lt = infer_expr_type(cg, expr->data.binary.left);
         ValueType rt = infer_expr_type(cg, expr->data.binary.right);
         if (is_float(lt)||is_float(rt)) return promote_float(lt,rt);
         return TYPE_INT;
     }
     case AST_UNARY_OP:
-        if (expr->data.unary.op == UOP_NOT) return TYPE_BOOL;
+        if (expr->data.unary.op == UOP_ADDR)  return TYPE_PTR;
+        if (expr->data.unary.op == UOP_DEREF) return TYPE_INT;
+        if (expr->data.unary.op == UOP_NOT)   return TYPE_BOOL;
         return infer_expr_type(cg, expr->data.unary.operand);
     case AST_CALL: {
         const char *fn = expr->data.call.func_name;
         if (strcmp(fn,"len")==0||strcmp(fn,"sizeof")==0) return TYPE_INT;
         if (strcmp(fn,"type")==0) return TYPE_STRING;
+        ASTNode *tmpl = find_generic_template(fn);
+        if (tmpl) {
+            char generic_name[MAX_TOKEN_LEN * 3];
+            if (queue_generic_instantiation(cg, tmpl,
+                                            expr->data.call.args,
+                                            expr->data.call.arg_count,
+                                            generic_name, sizeof(generic_name))) {
+                FunctionSig *gsig = func_sig_find(cg, generic_name);
+                if (gsig) return gsig->return_type;
+            }
+        }
         char mangled[MAX_TOKEN_LEN*2+4];
         if (cg->current_module[0] && mod_func_table_has(fn)) {
             make_module_symbol(mangled, sizeof(mangled), cg->current_module, fn);
             fn = mangled;
         }
         FunctionSig *sig = func_sig_find(cg, fn);
-        if (!sig) error_at(expr->line, expr->column,
+        if (!sig) error_at(ERR_TYPE, expr->line, expr->column,
                             "unknown function '%s'", expr->data.call.func_name);
         return sig->return_type;
     }
     case AST_MODULE_CALL: {
         char full[MAX_TOKEN_LEN*2+4];
+        const char *mod = expr->data.module_call.module_name;
+        const char *fn  = expr->data.module_call.func_name;
+        if (strcmp(mod, "io") == 0 && strcmp(fn, "chhaapln") == 0)
+            fn = "chhaapLine";
         snprintf(full,sizeof(full),"%s__%s",
-                 expr->data.module_call.module_name,
-                 expr->data.module_call.func_name);
+                 mod, fn);
         FunctionSig *sig = func_sig_find(cg, full);
-        if (!sig) error_at(expr->line, expr->column,
+        if (!sig) error_at(ERR_TYPE, expr->line, expr->column,
                             "unknown function '%s.%s'",
                             expr->data.module_call.module_name,
                             expr->data.module_call.func_name);
@@ -759,6 +1627,8 @@ static ValueType codegen_cast(CodeGen *cg, ValueType from, ValueType to) {
         case TYPE_OPT_BOOL:   codegen_emit(cg,"    mov rax, 2"); return to;
         case TYPE_OPT_F64:    codegen_emit(cg,"    mov rax, 0x7ff8000000000001"); return to;
         case TYPE_OPT_F32:    codegen_emit(cg,"    mov eax, 0x7fc00001"); return to;
+        case TYPE_OPT_STRUCT: codegen_emit(cg,"    xor rax, rax"); return to;
+        case TYPE_OPT_ARRAY:  codegen_emit(cg,"    xor rax, rax"); return to;
         default: break;
         }
     }
@@ -769,7 +1639,7 @@ static ValueType codegen_cast(CodeGen *cg, ValueType from, ValueType to) {
     /* int <-> optional int */
     if (from==TYPE_INT && to==TYPE_OPT_INT) return to;
     if (from==TYPE_OPT_INT && to==TYPE_INT) {
-        int nl=codegen_new_label(cg), el=codegen_new_label(cg);
+        int el=codegen_new_label(cg);
         codegen_emit(cg,"    mov rbx, 0x8000000000000000");
         codegen_emit(cg,"    cmp rax, rbx");
         codegen_emit(cg,"    jne _VL%d", el);
@@ -825,7 +1695,7 @@ static void codegen_copy_struct(CodeGen *cg, StructDef *sd,
 static void codegen_emit_struct_literal(CodeGen *cg, StructDef *sd,
                                         ASTNode *lit) {
     if (!lit || lit->type != AST_STRUCT_LITERAL)
-        error("expected struct literal");
+        error(ERR_SYNTAX, "expected struct literal");
     struct_size(cg, sd);
     bool *seen = (bool*)calloc(sd->field_count, 1);
 
@@ -833,7 +1703,7 @@ static void codegen_emit_struct_literal(CodeGen *cg, StructDef *sd,
         const char *fname = lit->data.struct_lit.field_names[i];
         ASTNode    *fval  = lit->data.struct_lit.field_values[i];
         int fidx = struct_field_index(sd, fname);
-        if (fidx < 0) error_at(lit->line, lit->column,
+        if (fidx < 0) error_at(ERR_TYPE, lit->line, lit->column,
                                 "unknown field '%s' on struct '%s'",
                                 fname, sd->name);
         seen[fidx] = true;
@@ -842,9 +1712,21 @@ static void codegen_emit_struct_literal(CodeGen *cg, StructDef *sd,
 
         if (expect == TYPE_STRUCT) {
             TypeInfo *fti = sd->field_typeinfo ? sd->field_typeinfo[fidx] : NULL;
-            if (!fti) error("struct field missing type info");
+            if (!fti) error(ERR_CODEGEN, "struct field missing type info");
+            if (is_generic_struct_slot(expect, fti)) {
+                codegen_emit(cg,"    push rbx");
+                ValueType at = codegen_expression(cg, fval);
+                codegen_emit(cg,"    pop rbx");
+                if (at == TYPE_STRUCT || at == TYPE_TUPLE)
+                    error_at(ERR_TYPE, fval->line, fval->column,
+                             "generic field '%s' does not support composite values yet", fname);
+                if (at == TYPE_F32) codegen_emit(cg,"    cvtss2sd xmm0, xmm0");
+                if (is_float(at)) codegen_emit(cg,"    movq rax, xmm0");
+                codegen_emit(cg,"    mov [rbx + %d], rax", off);
+                continue;
+            }
             StructDef *child = struct_find(cg, fti->struct_name);
-            if (!child) error("unknown struct '%s'", fti->struct_name);
+            if (!child) error(ERR_TYPE, "unknown struct '%s'", fti->struct_name);
             if (fval->type == AST_STRUCT_LITERAL) {
                 codegen_emit(cg,"    lea rdx, [rbx + %d]", off);
                 codegen_emit(cg,"    push rbx");
@@ -853,14 +1735,13 @@ static void codegen_emit_struct_literal(CodeGen *cg, StructDef *sd,
                 codegen_emit(cg,"    pop rbx");
             } else {
                 ValueType at = codegen_expression(cg, fval);
-                if (at != TYPE_STRUCT) error("field '%s' expects struct", fname);
+                if (at != TYPE_STRUCT) error(ERR_TYPE, "field '%s' expects struct", fname);
                 codegen_emit(cg,"    mov rcx, rax");
                 codegen_emit(cg,"    lea rdx, [rbx + %d]", off);
                 codegen_copy_struct(cg, child, "rdx", "rcx");
             }
         } else if (expect == TYPE_ARRAY) {
             /* array field in struct - store pointer or inline data */
-            TypeInfo *fti = sd->field_typeinfo ? sd->field_typeinfo[fidx] : NULL;
             codegen_emit(cg,"    push rbx");
             ValueType at = codegen_expression(cg, fval);
             codegen_emit(cg,"    pop rbx");
@@ -880,11 +1761,22 @@ static void codegen_emit_struct_literal(CodeGen *cg, StructDef *sd,
                 codegen_emit(cg,"    mov [rbx + %d], rax", off);
         }
     }
-    for (int i = 0; i < sd->field_count; i++)
-        if (!seen[i])
-            error_at(lit->line, lit->column,
-                     "missing field '%s' in '%s' literal",
-                     sd->field_names[i], sd->name);
+    if (sd->is_union) {
+        bool any = false;
+        for (int i = 0; i < sd->field_count; i++) {
+            if (seen[i]) { any = true; break; }
+        }
+        if (!any)
+            error_at(ERR_TYPE, lit->line, lit->column,
+                     "union literal '%s' requires at least one field",
+                     sd->name);
+    } else {
+        for (int i = 0; i < sd->field_count; i++)
+            if (!seen[i])
+                error_at(ERR_TYPE, lit->line, lit->column,
+                         "missing field '%s' in '%s' literal",
+                         sd->field_names[i], sd->name);
+    }
     free(seen);
 }
 
@@ -894,17 +1786,17 @@ static void codegen_emit_struct_literal(CodeGen *cg, StructDef *sd,
 static StructDef* emit_struct_addr(CodeGen *cg, ASTNode *expr) {
     if (expr->type == AST_IDENTIFIER) {
         int idx = codegen_find_var(cg, expr->data.identifier);
-        if (idx < 0) error_at(expr->line, expr->column,
+        if (idx < 0) error_at(ERR_TYPE, expr->line, expr->column,
                                "undefined variable '%s'", expr->data.identifier);
         if (cg->var_types[idx] != TYPE_STRUCT)
-            error_at(expr->line, expr->column,
+            error_at(ERR_TYPE, expr->line, expr->column,
                      "'%s' is not a struct", expr->data.identifier);
         TypeInfo *ti = cg->var_typeinfo[idx];
-        if (!ti) error("struct missing type info");
+        if (!ti) error(ERR_CODEGEN, "struct missing type info");
         StructDef *sd = struct_find(cg, ti->struct_name);
-        if (!sd) error("unknown struct '%s'", ti->struct_name);
+        if (!sd) error(ERR_TYPE, "unknown struct '%s'", ti->struct_name);
         struct_size(cg, sd);
-        if (ti->by_ref)
+        if (ti->by_ref || ti->is_ref)
             codegen_emit(cg,"    mov rax, [rbp - %d]", cg->var_offsets[idx]);
         else
             codegen_emit(cg,"    lea rax, [rbp - %d]", cg->var_offsets[idx]);
@@ -914,23 +1806,23 @@ static StructDef* emit_struct_addr(CodeGen *cg, ASTNode *expr) {
         /* arr[i] where arr is an array of structs -- emit pointer to element */
         ASTNode *base = expr->data.array_access.array;
         if (base->type != AST_IDENTIFIER)
-            error_at(expr->line, expr->column,
+            error_at(ERR_TYPE, expr->line, expr->column,
                      "array-of-struct access requires identifier base");
         int idx = codegen_find_var(cg, base->data.identifier);
-        if (idx < 0) error_at(expr->line, expr->column,
+        if (idx < 0) error_at(ERR_TYPE, expr->line, expr->column,
                                "undefined variable '%s'", base->data.identifier);
         if (cg->var_types[idx] != TYPE_ARRAY)
-            error_at(expr->line, expr->column,
+            error_at(ERR_TYPE, expr->line, expr->column,
                      "'%s' is not an array", base->data.identifier);
         TypeInfo *ti = cg->var_typeinfo[idx];
         if (!ti || ti->elem_type != TYPE_STRUCT)
-            error_at(expr->line, expr->column,
+            error_at(ERR_TYPE, expr->line, expr->column,
                      "'%s' is not an array of structs", base->data.identifier);
         if (!ti->elem_typeinfo)
-            error_at(expr->line, expr->column,
+            error_at(ERR_TYPE, expr->line, expr->column,
                      "array element missing struct type info");
         StructDef *sd = struct_find(cg, ti->elem_typeinfo->struct_name);
-        if (!sd) error("unknown struct '%s'", ti->elem_typeinfo->struct_name);
+        if (!sd) error(ERR_TYPE, "unknown struct '%s'", ti->elem_typeinfo->struct_name);
         struct_size(cg, sd);
 
         /* evaluate index -> rax, then compute element address */
@@ -938,7 +1830,11 @@ static StructDef* emit_struct_addr(CodeGen *cg, ASTNode *expr) {
         if (it != TYPE_INT) codegen_cast(cg, it, TYPE_INT);
         codegen_emit(cg,"    mov rcx, rax");
 
-        if (ti->by_ref || ti->array_len < 0)
+        if (ti->is_ref) {
+            codegen_emit(cg,"    mov rbx, [rbp - %d]", cg->var_offsets[idx]);
+            if (ti->array_len < 0)
+                codegen_emit(cg,"    mov rbx, [rbx]");
+        } else if (ti->by_ref || ti->array_len < 0)
             codegen_emit(cg,"    mov rbx, [rbp - %d]", cg->var_offsets[idx]);
         else
             codegen_emit(cg,"    lea rbx, [rbp - %d]", cg->var_offsets[idx]);
@@ -955,24 +1851,273 @@ static StructDef* emit_struct_addr(CodeGen *cg, ASTNode *expr) {
     if (expr->type == AST_FIELD_ACCESS) {
         StructDef *parent = emit_struct_addr(cg, expr->data.field_access.base);
         int fidx = struct_field_index(parent, expr->data.field_access.field_name);
-        if (fidx < 0) error_at(expr->line, expr->column,
+        if (fidx < 0) error_at(ERR_TYPE, expr->line, expr->column,
                                 "unknown field '%s'",
                                 expr->data.field_access.field_name);
         if (parent->field_types[fidx] != TYPE_STRUCT)
-            error_at(expr->line, expr->column,
+            error_at(ERR_TYPE, expr->line, expr->column,
                      "field '%s' is not a struct",
                      expr->data.field_access.field_name);
         struct_size(cg, parent);
         codegen_emit(cg,"    add rax, %d", parent->field_offsets[fidx]);
         TypeInfo *fti = parent->field_typeinfo ? parent->field_typeinfo[fidx] : NULL;
-        if (!fti) error("struct field missing type info");
+        if (!fti) error(ERR_CODEGEN, "struct field missing type info");
         StructDef *child = struct_find(cg, fti->struct_name);
-        if (!child) error("unknown struct '%s'", fti->struct_name);
+        if (!child) error(ERR_TYPE, "unknown struct '%s'", fti->struct_name);
         return child;
     }
-    error_at(expr->line, expr->column,
+    error_at(ERR_TYPE, expr->line, expr->column,
              "struct address requires identifier, array access, or field access base");
     return NULL;
+}
+
+static void emit_copy_bytes_x86(CodeGen *cg, const char *dst_reg,
+                                const char *src_reg, int size) {
+    codegen_emit(cg,"    mov rdi, %s", dst_reg);
+    codegen_emit(cg,"    mov rsi, %s", src_reg);
+    codegen_emit(cg,"    mov rcx, %d", size);
+    codegen_emit(cg,"    rep movsb");
+}
+
+static ValueType a64_cast_basic(CodeGen *cg, ValueType from, ValueType to) {
+    if (from == to) return to;
+    if (from == TYPE_INT && to == TYPE_F64) {
+        codegen_emit(cg,"    scvtf d0, x0");
+        return to;
+    }
+    if (from == TYPE_INT && to == TYPE_F32) {
+        codegen_emit(cg,"    scvtf s0, x0");
+        return to;
+    }
+    if (from == TYPE_F64 && to == TYPE_INT) {
+        codegen_emit(cg,"    fcvtzs x0, d0");
+        return to;
+    }
+    if (from == TYPE_F32 && to == TYPE_INT) {
+        codegen_emit(cg,"    fcvtzs x0, s0");
+        return to;
+    }
+    if (from == TYPE_F32 && to == TYPE_F64) {
+        codegen_emit(cg,"    fcvt d0, s0");
+        return to;
+    }
+    if (from == TYPE_F64 && to == TYPE_F32) {
+        codegen_emit(cg,"    fcvt s0, d0");
+        return to;
+    }
+    if (from == TYPE_BOOL && to == TYPE_F64) {
+        codegen_emit(cg,"    scvtf d0, x0");
+        return to;
+    }
+    if (from == TYPE_BOOL && to == TYPE_F32) {
+        codegen_emit(cg,"    scvtf s0, x0");
+        return to;
+    }
+    return to;
+}
+
+static void emit_lvalue_addr_x86(CodeGen *cg, ASTNode *expr) {
+    if (!expr) error(ERR_SYNTAX, "missing lvalue");
+    if (expr->type == AST_UNARY_OP && expr->data.unary.op == UOP_ADDR) {
+        emit_lvalue_addr_x86(cg, expr->data.unary.operand);
+        return;
+    }
+    if (expr->type == AST_IDENTIFIER) {
+        int idx = codegen_find_var(cg, expr->data.identifier);
+        if (idx < 0) {
+            /* Not a local variable — check if it's a function name */
+            FunctionSig *_fsig = func_sig_find(cg, expr->data.identifier);
+            if (_fsig) {
+                if (cg->target_windows)
+                    codegen_emit(cg,"    lea rax, [%s]", expr->data.identifier);
+                else
+                    codegen_emit(cg,"    lea rax, [rel %s]", expr->data.identifier);
+                return;
+            }
+            error_at(ERR_TYPE, expr->line, expr->column,
+                     "undefined variable '%s'", expr->data.identifier);
+        }
+        ValueType t = cg->var_types[idx];
+        TypeInfo *ti = cg->var_typeinfo[idx];
+        int off = cg->var_offsets[idx];
+        if (ti && ti->is_ref) {
+            codegen_emit(cg,"    mov rax, [rbp - %d]", off);
+            return;
+        }
+        if (is_composite(t) && ti && ti->by_ref) {
+            codegen_emit(cg,"    mov rax, [rbp - %d]", off);
+            return;
+        }
+        codegen_emit(cg,"    lea rax, [rbp - %d]", off);
+        return;
+    }
+    if (expr->type == AST_ARRAY_ACCESS) {
+        ASTNode *base = expr->data.array_access.array;
+        TypeInfo *ti = NULL;
+        int idx = -1;
+        if (base->type == AST_IDENTIFIER) {
+            idx = codegen_find_var(cg, base->data.identifier);
+            if (idx < 0)
+                error_at(ERR_TYPE, expr->line, expr->column,
+                         "undefined variable '%s'", base->data.identifier);
+            if (cg->var_types[idx] != TYPE_ARRAY)
+                error_at(ERR_TYPE, expr->line, expr->column,
+                         "'%s' is not an array", base->data.identifier);
+            ti = cg->var_typeinfo[idx];
+        } else {
+            /* e.g. self.data[i] where base is a field access returning TYPE_ARRAY */
+            ti = expr_typeinfo(cg, base);
+        }
+        if (!ti) error_at(ERR_CODEGEN, expr->line, expr->column, "array missing type info");
+
+        ValueType it = codegen_expression(cg, expr->data.array_access.index);
+        if (it != TYPE_INT) codegen_cast(cg, it, TYPE_INT);
+        codegen_emit(cg,"    mov rcx, rax");
+
+        if (idx >= 0) {
+            if (ti->is_ref) {
+                codegen_emit(cg,"    mov rbx, [rbp - %d]", cg->var_offsets[idx]);
+                if (ti->array_len < 0)
+                    codegen_emit(cg,"    mov rbx, [rbx]");
+            } else if (ti->by_ref || ti->array_len < 0) {
+                codegen_emit(cg,"    mov rbx, [rbp - %d]", cg->var_offsets[idx]);
+            } else {
+                codegen_emit(cg,"    lea rbx, [rbp - %d]", cg->var_offsets[idx]);
+            }
+        } else {
+            /* base expression already yields pointer to first element */
+            codegen_expression(cg, base);
+            codegen_emit(cg,"    mov rbx, rax");
+        }
+
+        int elem_size = array_elem_size(cg, ti);
+        if (elem_size == 8) {
+            codegen_emit(cg,"    lea rax, [rbx + rcx*8]");
+        } else {
+            codegen_emit(cg,"    imul rcx, %d", elem_size);
+            codegen_emit(cg,"    lea rax, [rbx + rcx]");
+        }
+        return;
+    }
+    if (expr->type == AST_FIELD_ACCESS) {
+        StructDef *parent = emit_struct_addr(cg, expr->data.field_access.base);
+        int fidx = struct_field_index(parent, expr->data.field_access.field_name);
+        if (fidx < 0)
+            error_at(ERR_TYPE, expr->line, expr->column,
+                     "unknown field '%s'", expr->data.field_access.field_name);
+        struct_size(cg, parent);
+        codegen_emit(cg,"    add rax, %d", parent->field_offsets[fidx]);
+        return;
+    }
+    if (expr->type == AST_TUPLE_ACCESS) {
+        ASTNode *base = expr->data.tuple_access.tuple;
+        if (base->type != AST_IDENTIFIER)
+            error_at(ERR_TYPE, expr->line, expr->column, "tuple address requires identifier base");
+        int idx = codegen_find_var(cg, base->data.identifier);
+        if (idx < 0)
+            error_at(ERR_TYPE, expr->line, expr->column, "undefined variable '%s'", base->data.identifier);
+        int tidx = expr->data.tuple_access.index;
+        int off = cg->var_offsets[idx] - tidx * 8;
+        codegen_emit(cg,"    lea rax, [rbp - %d]", off);
+        return;
+    }
+    error_at(ERR_TYPE, expr->line, expr->column,
+             "reference arguments require an lvalue");
+}
+
+static void emit_lvalue_addr_a64(CodeGen *cg, ASTNode *expr) {
+    if (!expr) error(ERR_SYNTAX, "missing lvalue");
+    if (expr->type == AST_UNARY_OP && expr->data.unary.op == UOP_ADDR) {
+        emit_lvalue_addr_a64(cg, expr->data.unary.operand);
+        return;
+    }
+    if (expr->type == AST_IDENTIFIER) {
+        int idx = codegen_find_var(cg, expr->data.identifier);
+        if (idx < 0) {
+            /* Not a local variable — check if it's a function name */
+            FunctionSig *_fsig = func_sig_find(cg, expr->data.identifier);
+            if (_fsig) {
+                codegen_emit(cg,"    adrp x0, %s", expr->data.identifier);
+                codegen_emit(cg,"    add  x0, x0, :lo12:%s", expr->data.identifier);
+                return;
+            }
+            error_at(ERR_TYPE, expr->line, expr->column,
+                     "undefined variable '%s'", expr->data.identifier);
+        }
+        TypeInfo *ti = cg->var_typeinfo[idx];
+        int off = cg->var_offsets[idx];
+        if (ti && ti->is_ref) {
+            codegen_emit(cg,"    ldr  x0, [x29, #-%d]", off);
+            return;
+        }
+        codegen_emit(cg,"    sub  x0, x29, #%d", off);
+        return;
+    }
+    if (expr->type == AST_ARRAY_ACCESS) {
+        ASTNode *base = expr->data.array_access.array;
+        if (base->type != AST_IDENTIFIER)
+            error_at(ERR_TYPE, expr->line, expr->column,
+                     "array access requires identifier base");
+        int idx = codegen_find_var(cg, base->data.identifier);
+        if (idx < 0)
+            error_at(ERR_TYPE, expr->line, expr->column,
+                     "undefined variable '%s'", base->data.identifier);
+        if (cg->var_types[idx] != TYPE_ARRAY)
+            error_at(ERR_TYPE, expr->line, expr->column,
+                     "'%s' is not an array", base->data.identifier);
+        TypeInfo *ti = cg->var_typeinfo[idx];
+        if (!ti) error_at(ERR_CODEGEN, expr->line, expr->column, "array missing type info");
+        ValueType it = codegen_expr_a64(cg, expr->data.array_access.index);
+        if (it != TYPE_INT) error_at(ERR_TYPE, expr->line, expr->column, "array index must be integer");
+        codegen_emit(cg,"    mov  x10, x0");
+        if (ti->is_ref) {
+            codegen_emit(cg,"    ldr  x9, [x29, #-%d]", cg->var_offsets[idx]);
+            if (ti->array_len < 0)
+                codegen_emit(cg,"    ldr  x9, [x9]");
+        } else if (ti->by_ref || ti->array_len < 0) {
+            codegen_emit(cg,"    ldr  x9, [x29, #-%d]", cg->var_offsets[idx]);
+        } else {
+            codegen_emit(cg,"    sub  x9, x29, #%d", cg->var_offsets[idx]);
+        }
+        codegen_emit(cg,"    add  x0, x9, x10, lsl #3");
+        return;
+    }
+    if (expr->type == AST_FIELD_ACCESS) {
+        ASTNode *obj = expr->data.field_access.base;
+        emit_lvalue_addr_a64(cg, obj);
+        codegen_emit(cg,"    mov  x9, x0");
+        int foff = 0;
+        StructDef *sd = NULL;
+        TypeInfo *ti2 = expr_typeinfo(cg, obj);
+        if (ti2 && ti2->struct_name[0])
+            sd = struct_find(cg, ti2->struct_name);
+        if (sd) {
+            for (int j = 0; j < sd->field_count; j++) {
+                if (strcmp(sd->field_names[j], expr->data.field_access.field_name) == 0) break;
+                foff += 8;
+            }
+        }
+        codegen_emit(cg,"    add  x0, x9, #%d", foff);
+        return;
+    }
+    error_at(ERR_TYPE, expr->line, expr->column,
+             "reference arguments require an lvalue");
+}
+
+static void emit_copy_bytes_a64(CodeGen *cg, const char *dst_reg,
+                                const char *src_reg, int size) {
+    int loop_l = codegen_new_label(cg);
+    int done_l = codegen_new_label(cg);
+    codegen_emit(cg,"    mov  x9, %s", dst_reg);
+    codegen_emit(cg,"    mov  x10, %s", src_reg);
+    codegen_emit(cg,"    mov  x11, #%d", size);
+    codegen_emit(cg,".L%d:", loop_l);
+    codegen_emit(cg,"    cbz  x11, .L%d", done_l);
+    codegen_emit(cg,"    ldrb w12, [x10], #1");
+    codegen_emit(cg,"    strb w12, [x9], #1");
+    codegen_emit(cg,"    sub  x11, x11, #1");
+    codegen_emit(cg,"    b    .L%d", loop_l);
+    codegen_emit(cg,".L%d:", done_l);
 }
 
 /* ------------------------------------------------------------
@@ -1130,6 +2275,7 @@ static void codegen_emit_panic_helper(CodeGen *cg) {
     codegen_emit(cg, "    _VL_try_depth_rt resq 1");
     codegen_emit(cg, "    _VL_err_flag     resq 1");
     codegen_emit(cg, "    _VL_err_msg      resq 1");
+    codegen_emit(cg, "    _VL_err_code     resq 1");  /* raw thrown value */
     codegen_emit(cg, "section .text");
     codegen_emit(cg, "__vl_panic:");
     codegen_emit(cg, "    push rbp");
@@ -1248,7 +2394,7 @@ ValueType codegen_expression(CodeGen *cg, ASTNode *expr) {
 
     case AST_IDENTIFIER: {
         int idx = codegen_find_var(cg, expr->data.identifier);
-        if (idx < 0) error_at(expr->line, expr->column,
+        if (idx < 0) error_at(ERR_TYPE, expr->line, expr->column,
                                "undefined variable '%s'", expr->data.identifier);
         int off = cg->var_offsets[idx];
         ValueType t = cg->var_types[idx];
@@ -1269,11 +2415,15 @@ ValueType codegen_expression(CodeGen *cg, ASTNode *expr) {
         }
         if (is_composite(t)) {
             bool by_ref  = ti && (ti->by_ref || ti->is_ref);
-            bool dyn_arr = (t == TYPE_ARRAY && ti && ti->array_len < 0);
-            if (by_ref || dyn_arr)
+            bool dyn_arr = is_dyn_array_type(t, ti);
+            if (ti && ti->is_ref && dyn_arr) {
                 codegen_emit(cg,"    mov rax, [rbp - %d]", off);
-            else
+                codegen_emit(cg,"    mov rax, [rax]");
+            } else if (by_ref || dyn_arr) {
+                codegen_emit(cg,"    mov rax, [rbp - %d]", off);
+            } else {
                 codegen_emit(cg,"    lea rax, [rbp - %d]", off);
+            }
             return t;
         }
         if (t == TYPE_F32) { codegen_emit(cg,"    movss xmm0, [rbp - %d]", off); return TYPE_F32; }
@@ -1284,25 +2434,40 @@ ValueType codegen_expression(CodeGen *cg, ASTNode *expr) {
 
     case AST_ARRAY_ACCESS: {
         ASTNode *base = expr->data.array_access.array;
-        if (base->type != AST_IDENTIFIER)
-            error_at(expr->line, expr->column, "array access requires identifier base");
-        int idx = codegen_find_var(cg, base->data.identifier);
-        if (idx < 0) error_at(expr->line, expr->column,
-                               "undefined variable '%s'", base->data.identifier);
-        if (cg->var_types[idx] != TYPE_ARRAY)
-            error_at(expr->line, expr->column,
-                     "'%s' is not an array", base->data.identifier);
-        TypeInfo *ti = cg->var_typeinfo[idx];
-        if (!ti) error_at(expr->line, expr->column, "array missing type info");
+        TypeInfo *ti = NULL;
+        int idx = -1;
+        if (base->type == AST_IDENTIFIER) {
+            idx = codegen_find_var(cg, base->data.identifier);
+            if (idx < 0) error_at(ERR_TYPE, expr->line, expr->column,
+                                   "undefined variable '%s'", base->data.identifier);
+            if (cg->var_types[idx] != TYPE_ARRAY)
+                error_at(ERR_TYPE, expr->line, expr->column,
+                         "'%s' is not an array", base->data.identifier);
+            ti = cg->var_typeinfo[idx];
+        } else {
+            /* e.g. self.data[i] where base is a field access returning TYPE_ARRAY */
+            ti = expr_typeinfo(cg, base);
+        }
+        if (!ti) error_at(ERR_CODEGEN, expr->line, expr->column, "array missing type info");
 
         ValueType it = codegen_expression(cg, expr->data.array_access.index);
         if (it != TYPE_INT) codegen_cast(cg, it, TYPE_INT);
         codegen_emit(cg,"    mov rcx, rax");
 
-        if (ti->by_ref || ti->array_len < 0)
-            codegen_emit(cg,"    mov rbx, [rbp - %d]", cg->var_offsets[idx]);
-        else
-            codegen_emit(cg,"    lea rbx, [rbp - %d]", cg->var_offsets[idx]);
+        if (idx >= 0) {
+            if (ti->is_ref) {
+                codegen_emit(cg,"    mov rbx, [rbp - %d]", cg->var_offsets[idx]);
+                if (ti->array_len < 0)
+                    codegen_emit(cg,"    mov rbx, [rbx]");
+            } else if (ti->by_ref || ti->array_len < 0) {
+                codegen_emit(cg,"    mov rbx, [rbp - %d]", cg->var_offsets[idx]);
+            } else {
+                codegen_emit(cg,"    lea rbx, [rbp - %d]", cg->var_offsets[idx]);
+            }
+        } else {
+            codegen_expression(cg, base);
+            codegen_emit(cg,"    mov rbx, rax");
+        }
 
         int elem_size = array_elem_size(cg, ti);
         ValueType elem = ti->elem_type;
@@ -1357,14 +2522,14 @@ ValueType codegen_expression(CodeGen *cg, ASTNode *expr) {
     case AST_TUPLE_ACCESS: {
         ASTNode *base = expr->data.tuple_access.tuple;
         if (base->type != AST_IDENTIFIER)
-            error_at(expr->line, expr->column, "tuple access requires identifier");
+            error_at(ERR_TYPE, expr->line, expr->column, "tuple access requires identifier");
         int idx = codegen_find_var(cg, base->data.identifier);
-        if (idx < 0) error_at(expr->line, expr->column,
+        if (idx < 0) error_at(ERR_TYPE, expr->line, expr->column,
                                "undefined variable '%s'", base->data.identifier);
         TypeInfo *ti = cg->var_typeinfo[idx];
         int tidx = expr->data.tuple_access.index;
         if (!ti || tidx < 0 || tidx >= ti->tuple_count)
-            error_at(expr->line, expr->column, "tuple index out of range");
+            error_at(ERR_TYPE, expr->line, expr->column, "tuple index out of range");
         ValueType elem = ti->tuple_types[tidx];
         int elem_off = cg->var_offsets[idx] - tidx * 8;
         if (elem == TYPE_F32) { codegen_emit(cg,"    movss xmm0, [rbp - %d]", elem_off); return TYPE_F32; }
@@ -1379,16 +2544,19 @@ ValueType codegen_expression(CodeGen *cg, ASTNode *expr) {
         StructDef *sd = emit_struct_addr(cg, base);
         struct_size(cg, sd);
         int fidx = struct_field_index(sd, expr->data.field_access.field_name);
-        if (fidx < 0) error_at(expr->line, expr->column,
+        if (fidx < 0) error_at(ERR_TYPE, expr->line, expr->column,
                                 "unknown field '%s' on '%s'",
                                 expr->data.field_access.field_name, sd->name);
         ValueType ft = sd->field_types[fidx];
+        TypeInfo *fti = sd->field_typeinfo ? sd->field_typeinfo[fidx] : NULL;
         int off = sd->field_offsets[fidx];
         codegen_emit(cg,"    mov rbx, rax");
-        if (ft == TYPE_STRUCT) { codegen_emit(cg,"    add rax, %d", off); return TYPE_STRUCT; }
+        if (ft == TYPE_STRUCT && !is_generic_struct_slot(ft, fti)) {
+            codegen_emit(cg,"    add rax, %d", off);
+            return TYPE_STRUCT;
+        }
         if (ft == TYPE_ARRAY) {
             /* return pointer to array data */
-            TypeInfo *fti = sd->field_typeinfo ? sd->field_typeinfo[fidx] : NULL;
             if (fti && fti->array_len < 0)
                 codegen_emit(cg,"    mov rax, [rbx + %d]", off);
             else
@@ -1402,6 +2570,31 @@ ValueType codegen_expression(CodeGen *cg, ASTNode *expr) {
     }
 
     case AST_UNARY_OP: {
+        if (expr->data.unary.op == UOP_ADDR) {
+            /* &x — take address of a variable, returns a raw pointer */
+            emit_lvalue_addr_x86(cg, expr->data.unary.operand);
+            return TYPE_PTR;
+        }
+        if (expr->data.unary.op == UOP_DEREF) {
+            /* *ptr — load the 64-bit value at the pointer address.
+             * For ref params the identifier already auto-derefs to the value;
+             * we need only the stored pointer (one load) before the final deref. */
+            ASTNode *op = expr->data.unary.operand;
+            bool ref_op = false;
+            if (op->type == AST_IDENTIFIER) {
+                int _idx = codegen_find_var(cg, op->data.identifier);
+                if (_idx >= 0) {
+                    TypeInfo *_ti = cg->var_typeinfo[_idx];
+                    if (_ti && _ti->is_ref) {
+                        codegen_emit(cg,"    mov rax, [rbp - %d]", cg->var_offsets[_idx]);
+                        ref_op = true;
+                    }
+                }
+            }
+            if (!ref_op) codegen_expression(cg, op);
+            codegen_emit(cg,"    mov rax, [rax]");
+            return TYPE_INT;
+        }
         ValueType ot = codegen_expression(cg, expr->data.unary.operand);
         switch (expr->data.unary.op) {
         case UOP_BNOT:
@@ -1458,6 +2651,46 @@ ValueType codegen_expression(CodeGen *cg, ASTNode *expr) {
             return TYPE_BOOL;
         }
 
+        /* ?? null coalescing — short-circuit: skip right if left is non-null */
+        if (op == OP_COALESCE) {
+            int notnull_lbl = codegen_new_label(cg);
+            int done_lbl    = codegen_new_label(cg);
+            ValueType lt = codegen_expression(cg, expr->data.binary.left);
+            /* float optionals: move bits to integer register for comparison */
+            if (lt == TYPE_OPT_F64) codegen_emit(cg,"    movq rax, xmm0");
+            if (lt == TYPE_OPT_F32) codegen_emit(cg,"    movd eax, xmm0");
+            codegen_emit(cg,"    mov r10, rax");  /* save left value */
+            switch (lt) {
+            case TYPE_OPT_INT:
+                codegen_emit(cg,"    mov rbx, 0x8000000000000000");
+                codegen_emit(cg,"    cmp r10, rbx");
+                codegen_emit(cg,"    jne _VL%d", notnull_lbl); break;
+            case TYPE_OPT_BOOL:
+                codegen_emit(cg,"    cmp r10, 2");
+                codegen_emit(cg,"    jne _VL%d", notnull_lbl); break;
+            case TYPE_OPT_F64:
+                codegen_emit(cg,"    mov rbx, 0x7ff8000000000001");
+                codegen_emit(cg,"    cmp r10, rbx");
+                codegen_emit(cg,"    jne _VL%d", notnull_lbl); break;
+            case TYPE_OPT_F32:
+                codegen_emit(cg,"    cmp r10d, 0x7fc00001");
+                codegen_emit(cg,"    jne _VL%d", notnull_lbl); break;
+            default: /* OPT_STRING, OPT_STRUCT, OPT_ARRAY: null = 0 */
+                codegen_emit(cg,"    test r10, r10");
+                codegen_emit(cg,"    jnz  _VL%d", notnull_lbl); break;
+            }
+            /* is null: evaluate and return right side */
+            ValueType rt = codegen_expression(cg, expr->data.binary.right);
+            codegen_emit(cg,"    jmp  _VL%d", done_lbl);
+            /* not null: restore left (unwrapped) */
+            codegen_emit(cg,"_VL%d:", notnull_lbl);
+            codegen_emit(cg,"    mov  rax, r10");
+            if (lt == TYPE_OPT_F64) codegen_emit(cg,"    movq xmm0, rax");
+            if (lt == TYPE_OPT_F32) codegen_emit(cg,"    movd xmm0, eax");
+            codegen_emit(cg,"_VL%d:", done_lbl);
+            return rt;
+        }
+
         ValueType lt = codegen_expression(cg, expr->data.binary.left);
         if (is_float(lt)) {
             codegen_emit(cg,"    sub rsp, 8");
@@ -1480,6 +2713,8 @@ ValueType codegen_expression(CodeGen *cg, ASTNode *expr) {
                 case TYPE_OPT_BOOL:   sentinel=2; break;
                 case TYPE_OPT_F64:    sentinel=0x7ff8000000000001ULL; break;
                 case TYPE_OPT_F32:    sentinel=0x7fc00001ULL; break;
+                case TYPE_OPT_STRUCT: sentinel=0; break;
+                case TYPE_OPT_ARRAY:  sentinel=0; break;
                 default: sentinel=0; break;
             }
             if (lt==TYPE_NULL && rt==TYPE_NULL) {
@@ -1545,7 +2780,7 @@ ValueType codegen_expression(CodeGen *cg, ASTNode *expr) {
         }
 
         /* Float path */
-        if (op == OP_MOD) error_at(expr->line, expr->column,
+        if (op == OP_MOD) error_at(ERR_TYPE, expr->line, expr->column,
                                    "modulo (%) not supported for floats");
         ValueType resf = promote_float(lt, rt);
         if (rt == TYPE_INT) {
@@ -1572,10 +2807,26 @@ ValueType codegen_expression(CodeGen *cg, ASTNode *expr) {
             else                codegen_emit(cg,"    ucomiss xmm1, xmm0");
             codegen_emit(cg,"    mov rax, 0");
             switch(op) {
-            case OP_EQ: codegen_emit(cg,"    sete  al"); break;
-            case OP_NE: codegen_emit(cg,"    setne al"); break;
-            case OP_LT: codegen_emit(cg,"    setb  al"); break;
-            case OP_LE: codegen_emit(cg,"    setbe al"); break;
+            case OP_EQ:
+                codegen_emit(cg,"    sete  al");
+                codegen_emit(cg,"    setnp bl");
+                codegen_emit(cg,"    and   al, bl");
+                break;
+            case OP_NE:
+                codegen_emit(cg,"    setne al");
+                codegen_emit(cg,"    setp  bl");
+                codegen_emit(cg,"    or    al, bl");
+                break;
+            case OP_LT:
+                codegen_emit(cg,"    setb  al");
+                codegen_emit(cg,"    setnp bl");
+                codegen_emit(cg,"    and   al, bl");
+                break;
+            case OP_LE:
+                codegen_emit(cg,"    setbe al");
+                codegen_emit(cg,"    setnp bl");
+                codegen_emit(cg,"    and   al, bl");
+                break;
             case OP_GT: codegen_emit(cg,"    seta  al"); break;
             case OP_GE: codegen_emit(cg,"    setae al"); break;
             default: break;
@@ -1605,12 +2856,12 @@ ValueType codegen_expression(CodeGen *cg, ASTNode *expr) {
     }
 
     case AST_ARRAY_LITERAL:
-        error_at(expr->line, expr->column,
+        error_at(ERR_TYPE, expr->line, expr->column,
                  "array literals only valid in 'ath' initializers");
         return TYPE_ARRAY;
 
     case AST_STRUCT_LITERAL:
-        error_at(expr->line, expr->column,
+        error_at(ERR_TYPE, expr->line, expr->column,
                  "struct literals only valid in 'ath' initializers or returns");
         return TYPE_STRUCT;
 
@@ -1623,7 +2874,7 @@ ValueType codegen_expression(CodeGen *cg, ASTNode *expr) {
         /* len() */
         if (strcmp(call_name,"len")==0) {
             if (argc != 1)
-                error_at(expr->line, expr->column, "len() expects 1 argument");
+                error_at(ERR_TYPE, expr->line, expr->column, "len() expects 1 argument");
             ASTNode *arg = expr->data.call.args[0];
             ValueType at = codegen_expression(cg, arg);
             TypeInfo *ti = expr_typeinfo(cg, arg);
@@ -1673,19 +2924,19 @@ ValueType codegen_expression(CodeGen *cg, ASTNode *expr) {
                 return TYPE_INT;
             }
             if (at == TYPE_TUPLE) {
-                if (!ti) error_at(expr->line, expr->column,
+                if (!ti) error_at(ERR_TYPE, expr->line, expr->column,
                                   "len() requires tuple type info");
                 codegen_emit(cg,"    mov rax, %d", ti->tuple_count);
                 return TYPE_INT;
             }
-            error_at(expr->line, expr->column,
+            error_at(ERR_TYPE, expr->line, expr->column,
                      "len() not supported for type '%s'", value_type_name(at));
         }
 
         /* sizeof() */
         if (strcmp(call_name,"sizeof")==0) {
             if (argc!=1)
-                error_at(expr->line, expr->column, "sizeof() expects 1 argument");
+                error_at(ERR_TYPE, expr->line, expr->column, "sizeof() expects 1 argument");
             ASTNode *arg = expr->data.call.args[0];
             ValueType at = infer_expr_type(cg, arg);
             TypeInfo *ti = expr_typeinfo(cg, arg);
@@ -1697,7 +2948,7 @@ ValueType codegen_expression(CodeGen *cg, ASTNode *expr) {
         /* type() */
         if (strcmp(call_name,"type")==0) {
             if (argc!=1)
-                error_at(expr->line, expr->column, "type() expects 1 argument");
+                error_at(ERR_TYPE, expr->line, expr->column, "type() expects 1 argument");
             ASTNode *arg = expr->data.call.args[0];
             ValueType at = infer_expr_type(cg, arg);
             codegen_expression(cg, arg);
@@ -1710,16 +2961,16 @@ ValueType codegen_expression(CodeGen *cg, ASTNode *expr) {
         if (strcmp(call_name,"map")==0 || strcmp(call_name,"filter")==0) {
             bool is_filter = (strcmp(call_name,"filter")==0);
             if (argc!=2)
-                error_at(expr->line, expr->column,
+                error_at(ERR_TYPE, expr->line, expr->column,
                          "%s() expects 2 arguments", call_name);
             ASTNode *arr_expr = expr->data.call.args[0];
             ASTNode *lam_expr = expr->data.call.args[1];
             if (!lam_expr || lam_expr->type != AST_LAMBDA)
-                error_at(expr->line, expr->column,
+                error_at(ERR_TYPE, expr->line, expr->column,
                          "%s() expects lambda as second argument", call_name);
             TypeInfo *arr_ti = expr_typeinfo(cg, arr_expr);
             if (!arr_ti)
-                error_at(expr->line, expr->column,
+                error_at(ERR_TYPE, expr->line, expr->column,
                          "%s() requires typed array", call_name);
             ValueType elem_t = arr_ti->elem_type;
 
@@ -1799,7 +3050,7 @@ ValueType codegen_expression(CodeGen *cg, ASTNode *expr) {
             }
             ValueType body_t = codegen_expression(cg, lam_expr->data.lambda.body);
             if (is_filter) {
-                if (body_t != TYPE_BOOL) error("filter() lambda must return bool");
+                if (body_t != TYPE_BOOL) error(ERR_TYPE, "filter() lambda must return bool");
                 codegen_emit(cg,"    cmp rax, 0");
                 codegen_emit(cg,"    je  _VL%d", skip_l);
                 codegen_emit(cg,"    mov rcx, [rbp - %d]", idx_off);
@@ -1835,11 +3086,34 @@ ValueType codegen_expression(CodeGen *cg, ASTNode *expr) {
             return TYPE_ARRAY;
         }
 
-        /* Mangle for current module */
-        if (cg->current_module[0] && mod_func_table_has(call_name)) {
+        ASTNode *generic_tmpl = find_generic_template(call_name);
+        if (generic_tmpl) {
+            if (!queue_generic_instantiation(cg, generic_tmpl,
+                                             expr->data.call.args, argc,
+                                             mangled, sizeof(mangled))) {
+                error_at(ERR_TYPE, expr->line, expr->column,
+                         "could not instantiate generic function '%s'", call_name);
+            }
+            sig_name = mangled;
+            call_name = sig_name;
+        } else if (cg->current_module[0] && mod_func_table_has(call_name)) {
             make_module_symbol(mangled, sizeof(mangled),
                                cg->current_module, call_name);
             sig_name = mangled;
+            call_name = sig_name;
+        }
+
+        /* Selective import: anaw mod::func; → allow unqualified call */
+        if (!func_sig_find(cg, sig_name)) {
+            for (int _si = 0; _si < cg->sel_import_count; _si++) {
+                if (strcmp(cg->sel_import_funcs[_si], call_name) == 0) {
+                    snprintf(mangled, sizeof(mangled), "%s__%s",
+                             cg->sel_import_modules[_si], call_name);
+                    if (func_sig_find(cg, mangled)) {
+                        sig_name = mangled; call_name = sig_name; break;
+                    }
+                }
+            }
         }
 
         FunctionSig *sig = func_sig_find(cg, sig_name);
@@ -1856,20 +3130,15 @@ ValueType codegen_expression(CodeGen *cg, ASTNode *expr) {
             /* Check if this param is a reference param - pass address instead */
             bool is_ref_param = sig && sig->param_is_ref
                                 && i < sig->param_count && sig->param_is_ref[i];
-            if (is_ref_param && expr->data.call.args[i]->type == AST_IDENTIFIER) {
-                /* Pass &var: compute address of the local variable */
-                int vidx = codegen_find_var(cg,
-                               expr->data.call.args[i]->data.identifier);
-                if (vidx < 0)
-                    error_at(expr->line, expr->column,
-                             "undefined variable '%s' passed as reference",
-                             expr->data.call.args[i]->data.identifier);
-                TypeInfo *vti = cg->var_typeinfo[vidx];
-                /* If var is itself a ref param, pass its stored pointer through */
-                if (vti && vti->is_ref)
-                    codegen_emit(cg,"    mov rax, [rbp - %d]", cg->var_offsets[vidx]);
-                else
-                    codegen_emit(cg,"    lea rax, [rbp - %d]", cg->var_offsets[vidx]);
+            if (is_ref_param) {
+                /* If arg is already TYPE_PTR (a pointer variable or &x expression)
+                 * evaluate it normally — it already carries the address. */
+                ValueType arg_t = infer_expr_type(cg, expr->data.call.args[i]);
+                if (arg_t == TYPE_PTR) {
+                    codegen_expression(cg, expr->data.call.args[i]);
+                } else {
+                    emit_lvalue_addr_x86(cg, expr->data.call.args[i]);
+                }
             } else {
                 ValueType at = codegen_expression(cg, expr->data.call.args[i]);
                 ValueType ex = sig && i < sig->param_count ? sig->param_types[i] : at;
@@ -1888,17 +3157,21 @@ ValueType codegen_expression(CodeGen *cg, ASTNode *expr) {
         }
         for (int i = 0; i < argc + (ret_sret?1:0); i++)
             codegen_emit(cg,"    pop %s", arg_reg(cg, i));
-        if (cg->target_windows)
-            codegen_emit(cg,"    sub rsp, 32");  /* shadow space */
-        if (cg->current_module[0] && mod_func_table_has(call_name)) {
-            make_module_symbol(mangled, sizeof(mangled),
-                               cg->current_module, call_name);
-            codegen_emit(cg,"    call %s", mangled);
-        } else {
-            codegen_emit(cg,"    call %s", call_name);
+        /* Indirect call if call_name resolves to a function pointer variable */
+        {
+            int _fp = codegen_find_var(cg, expr->data.call.func_name);
+            bool _is_fp = _fp >= 0 &&
+                          (cg->var_types[_fp] == TYPE_FUNCPTR ||
+                           cg->var_types[_fp] == TYPE_PTR);
+            if (cg->target_windows) codegen_emit(cg,"    sub rsp, 32");
+            if (_is_fp) {
+                codegen_emit(cg,"    mov r11, [rbp - %d]", cg->var_offsets[_fp]);
+                codegen_emit(cg,"    call r11");
+            } else {
+                codegen_emit(cg,"    call %s", call_name);
+            }
+            if (cg->target_windows) codegen_emit(cg,"    add rsp, 32");
         }
-        if (cg->target_windows)
-            codegen_emit(cg,"    add rsp, 32");
         emit_try_error_probe(cg);
         if (ret_sret) {
             codegen_emit(cg,"    lea rax, [rbp - %d]", sret_off);
@@ -1910,9 +3183,189 @@ ValueType codegen_expression(CodeGen *cg, ASTNode *expr) {
     case AST_MODULE_CALL: {
         const char *mname = expr->data.module_call.module_name;
         const char *fname = expr->data.module_call.func_name;
+        if (strcmp(mname, "io") == 0 && strcmp(fname, "chhaapln") == 0)
+            fname = "chhaapLine";
         int argc = expr->data.module_call.arg_count;
         char full[MAX_TOKEN_LEN*2+4];
         snprintf(full, sizeof(full), "%s__%s", mname, fname);
+
+        /* ---- amal impl-block method dispatch: p.method(args) → StructName__method(&p, args) ---- */
+        {
+            int vi = codegen_find_var(cg, mname);
+            if (vi >= 0 && cg->var_types[vi] == TYPE_STRUCT) {
+                TypeInfo *vti = cg->var_typeinfo[vi];
+                if (vti && vti->struct_name[0] && method_find(cg, vti->struct_name, fname)) {
+                    char mangled[MAX_TOKEN_LEN*2+4];
+                    snprintf(mangled, sizeof(mangled), "%s__%s", vti->struct_name, fname);
+                    FunctionSig *sig = func_sig_find(cg, mangled);
+                    bool ret_sret = sig && (sig->return_type == TYPE_TUPLE ||
+                                           sig->return_type == TYPE_STRUCT);
+                    int sret_off = 0;
+                    if (ret_sret) {
+                        char tmpn[32];
+                        snprintf(tmpn, 32, "_tmp%d", codegen_new_label(cg));
+                        TypeInfo *ti = typeinfo_clone(sig->return_typeinfo);
+                        codegen_add_var(cg, tmpn, sig->return_type, true, ti);
+                        sret_off = cg->var_offsets[cg->var_count - 1];
+                    }
+                    /* push explicit args in reverse (they map to params 1..N in callee) */
+                    for (int i = argc - 1; i >= 0; i--) {
+                        ValueType at = codegen_expression(cg, expr->data.module_call.args[i]);
+                        int sig_pi = i + 1; /* param 0 is self */
+                        ValueType ex = (sig && sig_pi < sig->param_count)
+                                       ? sig->param_types[sig_pi] : at;
+                        if (at != ex) { codegen_cast(cg, at, ex); at = ex; }
+                        if (is_float(at)) {
+                            if (at == TYPE_F32)
+                                codegen_emit(cg,"    cvtss2sd xmm0, xmm0");
+                            codegen_emit(cg,"    movq rax, xmm0");
+                        }
+                        codegen_emit(cg,"    push rax");
+                    }
+                    /* push &self — address of the caller's struct slot */
+                    codegen_emit(cg,"    lea rax, [rbp - %d]", cg->var_offsets[vi]);
+                    codegen_emit(cg,"    push rax");
+                    /* push sret slot last so it lands in arg_reg(0) */
+                    if (ret_sret) {
+                        codegen_emit(cg,"    lea rax, [rbp - %d]", sret_off);
+                        codegen_emit(cg,"    push rax");
+                    }
+                    int total = 1 + argc + (ret_sret ? 1 : 0);
+                    for (int i = 0; i < total; i++)
+                        codegen_emit(cg,"    pop %s", arg_reg(cg, i));
+                    if (cg->target_windows) codegen_emit(cg,"    sub rsp, 32");
+                    codegen_emit(cg,"    call %s", mangled);
+                    if (cg->target_windows) codegen_emit(cg,"    add rsp, 32");
+                    if (ret_sret) {
+                        codegen_emit(cg,"    lea rax, [rbp - %d]", sret_off);
+                        return sig->return_type;
+                    }
+                    return sig ? sig->return_type : TYPE_INT;
+                }
+            }
+        }
+
+        /* Optional methods: val.unwrap_or(default) / val.is_some() / val.is_none() */
+        {
+            int vi = codegen_find_var(cg, mname);
+            if (vi >= 0 && is_optional(cg->var_types[vi])) {
+                ValueType ot = cg->var_types[vi];
+                /* Helper macro: emit null-sentinel check for optional type ot,
+                   leaving rax loaded from the variable and setting flags. */
+                #define EMIT_OPT_LOAD_AND_CMP(jne_or_jnz, lbl) do { \
+                    codegen_emit(cg,"    mov rax, [rbp - %d]", cg->var_offsets[vi]); \
+                    switch (ot) { \
+                    case TYPE_OPT_INT: \
+                        codegen_emit(cg,"    mov rbx, 0x8000000000000000"); \
+                        codegen_emit(cg,"    cmp rax, rbx"); \
+                        codegen_emit(cg,"    " jne_or_jnz " _VL%d", lbl); break; \
+                    case TYPE_OPT_BOOL: \
+                        codegen_emit(cg,"    cmp rax, 2"); \
+                        codegen_emit(cg,"    " jne_or_jnz " _VL%d", lbl); break; \
+                    case TYPE_OPT_F64: \
+                        codegen_emit(cg,"    mov rbx, 0x7ff8000000000001"); \
+                        codegen_emit(cg,"    cmp rax, rbx"); \
+                        codegen_emit(cg,"    " jne_or_jnz " _VL%d", lbl); break; \
+                    case TYPE_OPT_F32: \
+                        codegen_emit(cg,"    cmp eax, 0x7fc00001"); \
+                        codegen_emit(cg,"    " jne_or_jnz " _VL%d", lbl); break; \
+                    default: \
+                        codegen_emit(cg,"    test rax, rax"); \
+                        codegen_emit(cg,"    " jne_or_jnz " _VL%d", lbl); break; \
+                    } \
+                } while(0)
+
+                if (strcmp(fname,"is_some")==0 && argc==0) {
+                    int lbl = codegen_new_label(cg);
+                    EMIT_OPT_LOAD_AND_CMP("jne", lbl);
+                    /* null path */
+                    codegen_emit(cg,"    xor rax, rax");
+                    int done = codegen_new_label(cg);
+                    codegen_emit(cg,"    jmp _VL%d", done);
+                    codegen_emit(cg,"_VL%d:", lbl);
+                    codegen_emit(cg,"    mov rax, 1");
+                    codegen_emit(cg,"_VL%d:", done);
+                    #undef EMIT_OPT_LOAD_AND_CMP
+                    return TYPE_BOOL;
+                }
+                #undef EMIT_OPT_LOAD_AND_CMP
+                #define EMIT_OPT_LOAD_AND_CMP(jne_or_jnz, lbl) do { \
+                    codegen_emit(cg,"    mov rax, [rbp - %d]", cg->var_offsets[vi]); \
+                    switch (ot) { \
+                    case TYPE_OPT_INT: \
+                        codegen_emit(cg,"    mov rbx, 0x8000000000000000"); \
+                        codegen_emit(cg,"    cmp rax, rbx"); \
+                        codegen_emit(cg,"    " jne_or_jnz " _VL%d", lbl); break; \
+                    case TYPE_OPT_BOOL: \
+                        codegen_emit(cg,"    cmp rax, 2"); \
+                        codegen_emit(cg,"    " jne_or_jnz " _VL%d", lbl); break; \
+                    case TYPE_OPT_F64: \
+                        codegen_emit(cg,"    mov rbx, 0x7ff8000000000001"); \
+                        codegen_emit(cg,"    cmp rax, rbx"); \
+                        codegen_emit(cg,"    " jne_or_jnz " _VL%d", lbl); break; \
+                    case TYPE_OPT_F32: \
+                        codegen_emit(cg,"    cmp eax, 0x7fc00001"); \
+                        codegen_emit(cg,"    " jne_or_jnz " _VL%d", lbl); break; \
+                    default: \
+                        codegen_emit(cg,"    test rax, rax"); \
+                        codegen_emit(cg,"    " jne_or_jnz " _VL%d", lbl); break; \
+                    } \
+                } while(0)
+                if (strcmp(fname,"is_none")==0 && argc==0) {
+                    int lbl = codegen_new_label(cg);
+                    EMIT_OPT_LOAD_AND_CMP("jne", lbl);
+                    /* null path → is_none = true */
+                    codegen_emit(cg,"    mov rax, 1");
+                    int done = codegen_new_label(cg);
+                    codegen_emit(cg,"    jmp _VL%d", done);
+                    codegen_emit(cg,"_VL%d:", lbl);
+                    codegen_emit(cg,"    xor rax, rax");
+                    codegen_emit(cg,"_VL%d:", done);
+                    #undef EMIT_OPT_LOAD_AND_CMP
+                    return TYPE_BOOL;
+                }
+                #undef EMIT_OPT_LOAD_AND_CMP
+                #define EMIT_OPT_LOAD_AND_CMP(jne_or_jnz, lbl) do { \
+                    codegen_emit(cg,"    mov rax, [rbp - %d]", cg->var_offsets[vi]); \
+                    switch (ot) { \
+                    case TYPE_OPT_INT: \
+                        codegen_emit(cg,"    mov rbx, 0x8000000000000000"); \
+                        codegen_emit(cg,"    cmp rax, rbx"); \
+                        codegen_emit(cg,"    " jne_or_jnz " _VL%d", lbl); break; \
+                    case TYPE_OPT_BOOL: \
+                        codegen_emit(cg,"    cmp rax, 2"); \
+                        codegen_emit(cg,"    " jne_or_jnz " _VL%d", lbl); break; \
+                    case TYPE_OPT_F64: \
+                        codegen_emit(cg,"    mov rbx, 0x7ff8000000000001"); \
+                        codegen_emit(cg,"    cmp rax, rbx"); \
+                        codegen_emit(cg,"    " jne_or_jnz " _VL%d", lbl); break; \
+                    case TYPE_OPT_F32: \
+                        codegen_emit(cg,"    cmp eax, 0x7fc00001"); \
+                        codegen_emit(cg,"    " jne_or_jnz " _VL%d", lbl); break; \
+                    default: \
+                        codegen_emit(cg,"    test rax, rax"); \
+                        codegen_emit(cg,"    " jne_or_jnz " _VL%d", lbl); break; \
+                    } \
+                } while(0)
+                if (strcmp(fname,"unwrap_or")==0 && argc==1) {
+                    int notnull = codegen_new_label(cg);
+                    int done    = codegen_new_label(cg);
+                    EMIT_OPT_LOAD_AND_CMP("jne", notnull);
+                    /* null: eval and return default */
+                    ValueType rt = codegen_expression(cg, expr->data.module_call.args[0]);
+                    codegen_emit(cg,"    jmp _VL%d", done);
+                    /* not null: return unwrapped value */
+                    codegen_emit(cg,"_VL%d:", notnull);
+                    codegen_emit(cg,"    mov rax, [rbp - %d]", cg->var_offsets[vi]);
+                    if (ot==TYPE_OPT_F64) { codegen_emit(cg,"    movq xmm0, rax"); rt=TYPE_F64; }
+                    else if (ot==TYPE_OPT_F32) { codegen_emit(cg,"    movd xmm0, eax"); rt=TYPE_F32; }
+                    codegen_emit(cg,"_VL%d:", done);
+                    #undef EMIT_OPT_LOAD_AND_CMP
+                    return rt;
+                }
+                #undef EMIT_OPT_LOAD_AND_CMP
+            }
+        }
 
         /* system.argv() -> build array from argc/argv */
         if (strcmp(mname,"system")==0 && strcmp(fname,"argv")==0 && argc==0) {
@@ -1943,10 +3396,13 @@ ValueType codegen_expression(CodeGen *cg, ASTNode *expr) {
         if (strcmp(mname,"io")==0 && strcmp(fname,"chhaap")==0 && argc==1 &&
             expr->data.module_call.args[0]->type != AST_STRING) {
             ValueType at = codegen_expression(cg, expr->data.module_call.args[0]);
+            TypeInfo *ati = expr_typeinfo(cg, expr->data.module_call.args[0]);
             const char *fmt = "%d";
-            if (at==TYPE_STRING||at==TYPE_OPT_STRING) fmt="%s";
+            if (at==TYPE_STRING||at==TYPE_OPT_STRING||is_byte_buffer(at, ati)) fmt="%s";
             else if (at==TYPE_BOOL) fmt="%b";
             else if (is_float(at)) fmt="%f";
+            else if (is_unsigned(at)) fmt="%u";
+            else if (at==TYPE_PTR||at==TYPE_FUNCPTR) fmt="%x";
             if (is_float(at)) {
                 if (at==TYPE_F32) codegen_emit(cg,"    cvtss2sd xmm0, xmm0");
                 codegen_emit(cg,"    movq rax, xmm0");
@@ -1954,6 +3410,179 @@ ValueType codegen_expression(CodeGen *cg, ASTNode *expr) {
             codegen_emit(cg,"    push rax");
             int sid = codegen_intern_string(cg, fmt);
             codegen_emit(cg,"    lea rax, [rel _VL_str_%d]", sid);
+            codegen_emit(cg,"    push rax");
+            codegen_emit(cg,"    pop %s", arg_reg(cg,0));
+            codegen_emit(cg,"    pop %s", arg_reg(cg,1));
+            if (cg->target_windows) codegen_emit(cg,"    sub rsp, 32");
+            codegen_emit(cg,"    call io__chhaap");
+            if (cg->target_windows) codegen_emit(cg,"    add rsp, 32");
+            return TYPE_INT;
+        }
+
+        /* io.print(x) / io.println(x) — generic print, same as chhaapLine */
+        if (strcmp(mname,"io")==0 &&
+            (strcmp(fname,"print")==0 || strcmp(fname,"println")==0) && argc==1 &&
+            expr->data.module_call.args[0]->type != AST_STRING) {
+            ValueType at = codegen_expression(cg, expr->data.module_call.args[0]);
+            TypeInfo *ati = expr_typeinfo(cg, expr->data.module_call.args[0]);
+            const char *fmt = "%d\n";
+            if (at==TYPE_STRING||at==TYPE_OPT_STRING||is_byte_buffer(at, ati)) fmt="%s\n";
+            else if (at==TYPE_BOOL) fmt="%b\n";
+            else if (is_float(at)) fmt="%f\n";
+            else if (is_unsigned(at)) fmt="%u\n";
+            else if (at==TYPE_PTR||at==TYPE_FUNCPTR) fmt="%x\n";
+            if (is_float(at)) {
+                if (at==TYPE_F32) codegen_emit(cg,"    cvtss2sd xmm0, xmm0");
+                codegen_emit(cg,"    movq rax, xmm0");
+            }
+            codegen_emit(cg,"    push rax");
+            int sid = codegen_intern_string(cg, fmt);
+            codegen_emit(cg,"    lea rax, [rel _VL_str_%d]", sid);
+            codegen_emit(cg,"    push rax");
+            codegen_emit(cg,"    pop %s", arg_reg(cg,0));
+            codegen_emit(cg,"    pop %s", arg_reg(cg,1));
+            if (cg->target_windows) codegen_emit(cg,"    sub rsp, 32");
+            codegen_emit(cg,"    call io__chhaap");
+            if (cg->target_windows) codegen_emit(cg,"    add rsp, 32");
+            return TYPE_INT;
+        }
+
+        /* io.print(x) / io.println(x) with literal string arg */
+        if (strcmp(mname,"io")==0 &&
+            (strcmp(fname,"print")==0 || strcmp(fname,"println")==0) && argc==1 &&
+            expr->data.module_call.args[0]->type == AST_STRING) {
+            /* io__chhaapLine only emits '\n', so string literals must go via io__chhaap. */
+            ASTNode *sarg = expr->data.module_call.args[0];
+            int sid = codegen_intern_string(cg, sarg->data.string_lit.value);
+            int fmt_sid = codegen_intern_string(cg, "%s\n");
+            codegen_emit(cg,"    lea rax, [rel _VL_str_%d]", sid);
+            codegen_emit(cg,"    push rax");
+            codegen_emit(cg,"    lea rax, [rel _VL_str_%d]", fmt_sid);
+            codegen_emit(cg,"    push rax");
+            codegen_emit(cg,"    pop %s", arg_reg(cg,0));
+            codegen_emit(cg,"    pop %s", arg_reg(cg,1));
+            if (cg->target_windows) codegen_emit(cg,"    sub rsp, 32");
+            codegen_emit(cg,"    call io__chhaap");
+            if (cg->target_windows) codegen_emit(cg,"    add rsp, 32");
+            return TYPE_INT;
+        }
+
+        /* io.debug(x) — prints "type: value\n" */
+        if (strcmp(mname,"io")==0 && strcmp(fname,"debug")==0 && argc==1) {
+            ValueType at = codegen_expression(cg, expr->data.module_call.args[0]);
+            TypeInfo *ati = expr_typeinfo(cg, expr->data.module_call.args[0]);
+            const char *type_name = "adad";
+            const char *val_fmt   = "%d";
+            if (at==TYPE_STRING||at==TYPE_OPT_STRING||is_byte_buffer(at,ati))
+                { type_name="lafz";   val_fmt="%s"; }
+            else if (at==TYPE_BOOL)    { type_name="bool";    val_fmt="%b"; }
+            else if (at==TYPE_F64)    { type_name="ashari";  val_fmt="%f"; }
+            else if (at==TYPE_F32)    { type_name="ashari32";val_fmt="%f"; }
+            else if (is_unsigned(at)) { type_name="uadad";   val_fmt="%u"; }
+            else if (at==TYPE_PTR)    { type_name="*rawptr"; val_fmt="%x"; }
+            else if (at==TYPE_FUNCPTR){ type_name="kar";     val_fmt="%x"; }
+            else if (at==TYPE_ARRAY)  { type_name="array";   val_fmt="%d"; }
+            if (is_float(at)) {
+                if (at==TYPE_F32) codegen_emit(cg,"    cvtss2sd xmm0, xmm0");
+                codegen_emit(cg,"    movq rax, xmm0");
+            }
+            codegen_emit(cg,"    push rax");
+            /* Build combined format: "type_name: val_fmt\n" */
+            char dbg_fmt[128];
+            snprintf(dbg_fmt, sizeof(dbg_fmt), "%s: %s\n", type_name, val_fmt);
+            int sid = codegen_intern_string(cg, dbg_fmt);
+            codegen_emit(cg,"    lea rax, [rel _VL_str_%d]", sid);
+            codegen_emit(cg,"    push rax");
+            codegen_emit(cg,"    pop %s", arg_reg(cg,0));
+            codegen_emit(cg,"    pop %s", arg_reg(cg,1));
+            if (cg->target_windows) codegen_emit(cg,"    sub rsp, 32");
+            codegen_emit(cg,"    call io__chhaap");
+            if (cg->target_windows) codegen_emit(cg,"    add rsp, 32");
+            return TYPE_INT;
+        }
+
+        /* io.printArr(arr) — prints [e0, e1, ..., eN-1]\n */
+        if (strcmp(mname,"io")==0 && strcmp(fname,"printArr")==0 && argc==1) {
+            ValueType at = codegen_expression(cg, expr->data.module_call.args[0]);
+            TypeInfo *ati = expr_typeinfo(cg, expr->data.module_call.args[0]);
+            ValueType et = (ati && (ati->kind==TYPE_ARRAY||ati->elem_type!=0))
+                           ? ati->elem_type : TYPE_INT;
+            const char *elem_fmt = (et==TYPE_F64||et==TYPE_F32) ? "%f"
+                                 : (et==TYPE_STRING)             ? "%s" : "%d";
+            int arr_lbl = codegen_new_label(cg);
+            /* rax = data ptr */
+            codegen_emit(cg,"    mov r10, rax");
+            codegen_emit(cg,"    mov r11, [rax - 8]");   /* r11 = len */
+            /* print "[" */
+            int open_sid = codegen_intern_string(cg, "[");
+            int fmts_sid = codegen_intern_string(cg, "%s");
+            codegen_emit(cg,"    push r10"); codegen_emit(cg,"    push r11");
+            codegen_emit(cg,"    lea rax, [rel _VL_str_%d]", open_sid);
+            codegen_emit(cg,"    push rax");
+            codegen_emit(cg,"    lea rax, [rel _VL_str_%d]", fmts_sid);
+            codegen_emit(cg,"    push rax");
+            codegen_emit(cg,"    pop %s", arg_reg(cg,0));
+            codegen_emit(cg,"    pop %s", arg_reg(cg,1));
+            if (cg->target_windows) codegen_emit(cg,"    sub rsp, 32");
+            codegen_emit(cg,"    call io__chhaap");
+            if (cg->target_windows) codegen_emit(cg,"    add rsp, 32");
+            codegen_emit(cg,"    pop r11"); codegen_emit(cg,"    pop r10");
+            /* loop: i in 0..len */
+            codegen_emit(cg,"    xor r12, r12");
+            codegen_emit(cg,"_VL_parr_lp%d:", arr_lbl);
+            codegen_emit(cg,"    cmp r12, r11");
+            codegen_emit(cg,"    jge _VL_parr_dn%d", arr_lbl);
+            /* load element */
+            if (et==TYPE_F64)
+                codegen_emit(cg,"    movsd xmm0, [r10 + r12*8]");
+            else if (et==TYPE_F32)
+                codegen_emit(cg,"    movss xmm0, [r10 + r12*8]");
+            else
+                codegen_emit(cg,"    mov rax, [r10 + r12*8]");
+            if (is_float((ValueType)et)) {
+                if (et==TYPE_F32) codegen_emit(cg,"    cvtss2sd xmm0, xmm0");
+                codegen_emit(cg,"    movq rax, xmm0");
+            }
+            /* save loop state, print element */
+            codegen_emit(cg,"    push r10"); codegen_emit(cg,"    push r11");
+            codegen_emit(cg,"    push r12");
+            codegen_emit(cg,"    push rax");
+            int efmt_sid = codegen_intern_string(cg, elem_fmt);
+            codegen_emit(cg,"    lea rax, [rel _VL_str_%d]", efmt_sid);
+            codegen_emit(cg,"    push rax");
+            codegen_emit(cg,"    pop %s", arg_reg(cg,0));
+            codegen_emit(cg,"    pop %s", arg_reg(cg,1));
+            if (cg->target_windows) codegen_emit(cg,"    sub rsp, 32");
+            codegen_emit(cg,"    call io__chhaap");
+            if (cg->target_windows) codegen_emit(cg,"    add rsp, 32");
+            codegen_emit(cg,"    pop r12"); codegen_emit(cg,"    pop r11");
+            codegen_emit(cg,"    pop r10");
+            /* separator ", " if not last */
+            codegen_emit(cg,"    inc r12");
+            codegen_emit(cg,"    cmp r12, r11");
+            codegen_emit(cg,"    jge _VL_parr_sep%d", arr_lbl);
+            codegen_emit(cg,"    push r10"); codegen_emit(cg,"    push r11");
+            codegen_emit(cg,"    push r12");
+            int sep_sid = codegen_intern_string(cg, ", ");
+            codegen_emit(cg,"    lea rax, [rel _VL_str_%d]", sep_sid);
+            codegen_emit(cg,"    push rax");
+            codegen_emit(cg,"    lea rax, [rel _VL_str_%d]", fmts_sid);
+            codegen_emit(cg,"    push rax");
+            codegen_emit(cg,"    pop %s", arg_reg(cg,0));
+            codegen_emit(cg,"    pop %s", arg_reg(cg,1));
+            if (cg->target_windows) codegen_emit(cg,"    sub rsp, 32");
+            codegen_emit(cg,"    call io__chhaap");
+            if (cg->target_windows) codegen_emit(cg,"    add rsp, 32");
+            codegen_emit(cg,"    pop r12"); codegen_emit(cg,"    pop r11");
+            codegen_emit(cg,"    pop r10");
+            codegen_emit(cg,"_VL_parr_sep%d:", arr_lbl);
+            codegen_emit(cg,"    jmp _VL_parr_lp%d", arr_lbl);
+            codegen_emit(cg,"_VL_parr_dn%d:", arr_lbl);
+            /* print "]\n" */
+            int close_sid = codegen_intern_string(cg, "]\n");
+            codegen_emit(cg,"    lea rax, [rel _VL_str_%d]", close_sid);
+            codegen_emit(cg,"    push rax");
+            codegen_emit(cg,"    lea rax, [rel _VL_str_%d]", fmts_sid);
             codegen_emit(cg,"    push rax");
             codegen_emit(cg,"    pop %s", arg_reg(cg,0));
             codegen_emit(cg,"    pop %s", arg_reg(cg,1));
@@ -1967,10 +3596,13 @@ ValueType codegen_expression(CodeGen *cg, ASTNode *expr) {
         if (strcmp(mname,"io")==0 && strcmp(fname,"chhaapLine")==0 && argc==1 &&
             expr->data.module_call.args[0]->type != AST_STRING) {
             ValueType at = codegen_expression(cg, expr->data.module_call.args[0]);
+            TypeInfo *ati = expr_typeinfo(cg, expr->data.module_call.args[0]);
             const char *fmt = "%d\n";
-            if (at==TYPE_STRING||at==TYPE_OPT_STRING) fmt="%s\n";
+            if (at==TYPE_STRING||at==TYPE_OPT_STRING||is_byte_buffer(at, ati)) fmt="%s\n";
             else if (at==TYPE_BOOL) fmt="%b\n";
             else if (is_float(at)) fmt="%f\n";
+            else if (is_unsigned(at)) fmt="%u\n";
+            else if (at==TYPE_PTR||at==TYPE_FUNCPTR) fmt="%x\n";
             if (is_float(at)) {
                 if (at==TYPE_F32) codegen_emit(cg,"    cvtss2sd xmm0, xmm0");
                 codegen_emit(cg,"    movq rax, xmm0");
@@ -1987,7 +3619,31 @@ ValueType codegen_expression(CodeGen *cg, ASTNode *expr) {
             return TYPE_INT;
         }
 
+        /* String-literal io.chhaapLine(x) also needs the formatted path. */
+        if (strcmp(mname,"io")==0 && strcmp(fname,"chhaapLine")==0 && argc==1 &&
+            expr->data.module_call.args[0]->type == AST_STRING) {
+            ASTNode *sarg = expr->data.module_call.args[0];
+            int sid = codegen_intern_string(cg, sarg->data.string_lit.value);
+            int fmt_sid = codegen_intern_string(cg, "%s\n");
+            codegen_emit(cg,"    lea rax, [rel _VL_str_%d]", sid);
+            codegen_emit(cg,"    push rax");
+            codegen_emit(cg,"    lea rax, [rel _VL_str_%d]", fmt_sid);
+            codegen_emit(cg,"    push rax");
+            codegen_emit(cg,"    pop %s", arg_reg(cg,0));
+            codegen_emit(cg,"    pop %s", arg_reg(cg,1));
+            if (cg->target_windows) codegen_emit(cg,"    sub rsp, 32");
+            codegen_emit(cg,"    call io__chhaap");
+            if (cg->target_windows) codegen_emit(cg,"    add rsp, 32");
+            return TYPE_INT;
+        }
+
         FunctionSig *sig = func_sig_find(cg, full);
+        if (strcmp(mname,"io")==0 && (strcmp(fname,"read")==0 || strcmp(fname,"write")==0)) {
+            if (argc != 3)
+                error_at(ERR_TYPE, expr->line, expr->column, "io.%s expects 3 arguments", fname);
+            validate_io_buffer_arg(cg, expr->data.module_call.args[1],
+                                   expr->line, expr->column, fname);
+        }
         bool ret_sret = sig && (sig->return_type==TYPE_TUPLE ||
                                 sig->return_type==TYPE_STRUCT);
         int sret_off = 0;
@@ -2026,8 +3682,27 @@ ValueType codegen_expression(CodeGen *cg, ASTNode *expr) {
         return sig ? sig->return_type : TYPE_INT;
     }
 
+    /* -- expr as TargetType (explicit cast) -- */
+    case AST_CAST: {
+        ValueType from = codegen_expression(cg, expr->data.cast.expr);
+        ValueType to   = expr->data.cast.target_type;
+        if (from != to) codegen_cast(cg, from, to);
+        return to;
+    }
+
+    /* -- saabit constant reference (resolved at parse-time to integer) -- */
+    case AST_CONST_DECL:
+        codegen_emit(cg,"    mov rax, %lld", expr->data.const_decl.value);
+        return TYPE_INT;
+
+    /* AST_DEREF_ASSIGN cannot appear as an expression; guard for safety */
+    case AST_DEREF_ASSIGN:
+        error_at(ERR_TYPE, expr->line, expr->column,
+                 "deref-assign cannot be used as expression");
+        return TYPE_INT;
+
     default:
-        error_at(expr->line, expr->column,
+        error_at(ERR_TYPE, expr->line, expr->column,
                  "codegen_expression: unhandled node type %d", expr->type);
         return TYPE_INT;
     }
@@ -2066,15 +3741,15 @@ void codegen_statement(CodeGen *cg, ASTNode *stmt) {
                     int count = rv->data.tuple_lit.count;
                     for (int i = 0; i < count; i++) {
                         ValueType et = codegen_expression(cg, rv->data.tuple_lit.elements[i]);
+                        /* Expressions may clobber rbx; reload the sret base before storing. */
+                        codegen_emit(cg,"    mov rbx, [rbp - %d]", cg->sret_offset);
                         if (et==TYPE_F32) { codegen_emit(cg,"    movss [rbx + %d], xmm0", i*8); }
                         else if (et==TYPE_F64) { codegen_emit(cg,"    movsd [rbx + %d], xmm0", i*8); }
                         else { codegen_emit(cg,"    mov [rbx + %d], rax", i*8); }
-                        /* rbx may be clobbered if expression uses rbx - reload */
-                        codegen_emit(cg,"    mov rbx, [rbp - %d]", cg->sret_offset);
                     }
                 } else {
                     /* Expression yields a tuple pointer in rax — memcopy */
-                    ValueType rt = codegen_expression(cg, rv);
+                    codegen_expression(cg, rv);
                     int n = (rti && rti->tuple_count > 0) ? rti->tuple_count : 2;
                     codegen_emit(cg,"    mov rcx, rax");
                     for (int i = 0; i < n; i++) {
@@ -2125,16 +3800,41 @@ void codegen_statement(CodeGen *cg, ASTNode *stmt) {
         if (!stmt->data.let.has_type && val->type == AST_STRUCT_LITERAL) {
             TypeInfo *ti = (TypeInfo*)calloc(1, sizeof(TypeInfo));
             ti->kind = TYPE_STRUCT;
-            strncpy(ti->struct_name, val->data.struct_lit.struct_name, MAX_TOKEN_LEN-1);
+            vl_strncpy(ti->struct_name, val->data.struct_lit.struct_name, MAX_TOKEN_LEN);
             stmt->data.let.type_info = ti;
             stmt->data.let.var_type  = TYPE_STRUCT;
             stmt->data.let.has_type  = true;
             decl = TYPE_STRUCT;
         }
 
+        /* Auto-detect composite type from call return signature. This keeps common code like
+           `ath p = make_point();` working without needing `ath p: Point = ...`. */
+        if (!stmt->data.let.has_type &&
+            (val->type == AST_CALL || val->type == AST_MODULE_CALL)) {
+            FunctionSig *sig = NULL;
+            if (val->type == AST_CALL) {
+                sig = func_sig_find(cg, val->data.call.func_name);
+            } else {
+                char fn[MAX_TOKEN_LEN*2+4];
+                make_module_symbol(fn, sizeof(fn),
+                                   val->data.module_call.module_name,
+                                   val->data.module_call.func_name);
+                sig = func_sig_find(cg, fn);
+            }
+            if (sig && sig->return_typeinfo &&
+                (sig->return_type == TYPE_STRUCT ||
+                 sig->return_type == TYPE_TUPLE  ||
+                 sig->return_type == TYPE_ARRAY)) {
+                stmt->data.let.type_info = typeinfo_clone(sig->return_typeinfo);
+                stmt->data.let.var_type  = sig->return_type;
+                stmt->data.let.has_type  = true;
+                decl = sig->return_type;
+            }
+        }
+
         if (decl == TYPE_ARRAY) {
             TypeInfo *ti = stmt->data.let.type_info;
-            if (!ti) error_at(stmt->line, stmt->column,
+            if (!ti) error_at(ERR_TYPE, stmt->line, stmt->column,
                               "array declaration needs type annotation");
             codegen_add_var(cg, stmt->data.let.var_name, TYPE_ARRAY,
                             stmt->data.let.is_mut, ti);
@@ -2166,14 +3866,24 @@ void codegen_statement(CodeGen *cg, ASTNode *stmt) {
                                                         stmt->line, stmt->column);
                         if (at != ex) codegen_cast(cg, at, ex);
                         codegen_emit(cg,"    mov rbx, [rbp - %d]", off);
-                        if (ex == TYPE_F32) codegen_emit(cg,"    movss [rbx + %d], xmm0", i*elem_size);
-                        else if (ex == TYPE_F64) codegen_emit(cg,"    movsd [rbx + %d], xmm0", i*elem_size);
-                        else codegen_emit(cg,"    mov [rbx + %d], rax", i*elem_size);
+                        if (ex == TYPE_F32) {
+                            codegen_emit(cg,"    movss [rbx + %d], xmm0", i*elem_size);
+                        } else if (ex == TYPE_F64) {
+                            codegen_emit(cg,"    movsd [rbx + %d], xmm0", i*elem_size);
+                        } else if (ex == TYPE_STRUCT) {
+                            /* rax points to the source struct data; copy bytes into the array slot. */
+                            codegen_emit(cg,"    lea rdi, [rbx + %d]", i*elem_size);
+                            codegen_emit(cg,"    mov rsi, rax");
+                            codegen_emit(cg,"    mov rcx, %d", elem_size);
+                            codegen_emit(cg,"    rep movsb");
+                        } else {
+                            codegen_emit(cg,"    mov [rbx + %d], rax", i*elem_size);
+                        }
                     }
                 } else {
                     /* fixed-size: inline on stack */
                     if (count != ti->array_len)
-                        error_at(stmt->line, stmt->column,
+                        error_at(ERR_TYPE, stmt->line, stmt->column,
                                  "array literal has %d elements but type says %d",
                                  count, ti->array_len);
                     for (int i = 0; i < count; i++) {
@@ -2183,11 +3893,49 @@ void codegen_statement(CodeGen *cg, ASTNode *stmt) {
                                                         stmt->line, stmt->column);
                         if (at != ex) codegen_cast(cg, at, ex);
                         int elem_off = off - i * elem_size;
-                        if (ex == TYPE_F32) codegen_emit(cg,"    movss [rbp - %d], xmm0", elem_off);
-                        else if (ex == TYPE_F64) codegen_emit(cg,"    movsd [rbp - %d], xmm0", elem_off);
-                        else codegen_emit(cg,"    mov [rbp - %d], rax", elem_off);
+                        if (ex == TYPE_F32) {
+                            codegen_emit(cg,"    movss [rbp - %d], xmm0", elem_off);
+                        } else if (ex == TYPE_F64) {
+                            codegen_emit(cg,"    movsd [rbp - %d], xmm0", elem_off);
+                        } else if (ex == TYPE_STRUCT) {
+                            /* rax points to the source struct data; copy bytes into the inline array slot. */
+                            codegen_emit(cg,"    lea rdi, [rbp - %d]", elem_off);
+                            codegen_emit(cg,"    mov rsi, rax");
+                            codegen_emit(cg,"    mov rcx, %d", elem_size);
+                            codegen_emit(cg,"    rep movsb");
+                        } else {
+                            codegen_emit(cg,"    mov [rbp - %d], rax", elem_off);
+                        }
                     }
                 }
+            } else if (val->type == AST_STRING && ti && (ti->array_len < 0 || ti->is_dynamic) && ti->elem_type == TYPE_UINT8) {
+                /* Special case: convert string literal to dynamic byte array */
+                cg->needs_arr_alloc = true;
+                const char *s = val->data.string_lit.value;
+                int slen = strlen(s);
+                int sid = codegen_intern_string(cg, s);
+                
+                codegen_emit(cg,"    mov %s, %d", arg_reg(cg,0), slen + 1);
+                codegen_emit(cg,"    mov %s, 1", arg_reg(cg,1));
+                if (cg->target_windows) codegen_emit(cg,"    sub rsp, 32");
+                codegen_emit(cg,"    call __vl_arr_alloc");
+                if (cg->target_windows) codegen_emit(cg,"    add rsp, 32");
+                
+                codegen_emit(cg,"    mov rbx, rax");
+                codegen_emit(cg,"    mov qword [rbx - 8], %d", slen);
+                
+                /* Copy string into array */
+                codegen_emit(cg,"    lea rcx, [rel _VL_str_%d]", sid);
+                int lab = codegen_new_label(cg);
+                codegen_emit(cg,"    xor rdx, rdx");
+                codegen_emit(cg,"_VLstr_arr_%d:", lab);
+                codegen_emit(cg,"    mov al, [rcx + rdx]");
+                codegen_emit(cg,"    mov [rbx + rdx], al");
+                codegen_emit(cg,"    inc rdx");
+                codegen_emit(cg,"    cmp rdx, %d", slen + 1);
+                codegen_emit(cg,"    jl _VLstr_arr_%d", lab);
+                
+                codegen_emit(cg,"    mov [rbp - %d], rbx", off);
             } else {
                 /* initializer is an expression (function call returning array) */
                 ValueType vt = codegen_expression(cg, val);
@@ -2197,15 +3945,53 @@ void codegen_statement(CodeGen *cg, ASTNode *stmt) {
             break;
         }
 
+        if (decl == TYPE_OPT_STRUCT) {
+            TypeInfo *ti = stmt->data.let.type_info;
+            if (!ti) error_at(ERR_TYPE, stmt->line, stmt->column, "optional struct needs type info");
+            StructDef *sd = struct_find(cg, ti->struct_name);
+            if (!sd) error_at(ERR_TYPE, stmt->line, stmt->column,
+                              "unknown struct '%s'", ti->struct_name);
+            /* Variable stores a pointer (8 bytes): null=0, non-null=&data */
+            codegen_add_var(cg, stmt->data.let.var_name, TYPE_OPT_STRUCT,
+                            stmt->data.let.is_mut, ti);
+            int ptr_off = cg->var_offsets[cg->var_count - 1];
+            if (val->type == AST_NULL) {
+                codegen_emit(cg,"    mov qword [rbp - %d], 0", ptr_off);
+            } else if (val->type == AST_STRUCT_LITERAL) {
+                /* Allocate hidden TYPE_STRUCT inline for the data */
+                char hidden[MAX_TOKEN_LEN];
+                snprintf(hidden, sizeof(hidden), "_vl_opt_%s", stmt->data.let.var_name);
+                TypeInfo *hti = (TypeInfo*)calloc(1, sizeof(TypeInfo));
+                hti->kind = TYPE_STRUCT;
+                vl_strncpy(hti->struct_name, ti->struct_name, MAX_TOKEN_LEN);
+                codegen_add_var(cg, hidden, TYPE_STRUCT, true, hti);
+                int data_off = cg->var_offsets[cg->var_count - 1];
+                codegen_emit(cg,"    lea rbx, [rbp - %d]", data_off);
+                codegen_emit_struct_literal(cg, sd, val);
+                codegen_emit(cg,"    lea rax, [rbp - %d]", data_off);
+                codegen_emit(cg,"    mov [rbp - %d], rax", ptr_off);
+            } else {
+                ValueType vt = codegen_expression(cg, val);
+                if (vt == TYPE_STRUCT || vt == TYPE_OPT_STRUCT) {
+                    /* rax is already a pointer to struct data */
+                    codegen_emit(cg,"    mov [rbp - %d], rax", ptr_off);
+                } else {
+                    /* null (xor rax,rax) or other pointer */
+                    codegen_emit(cg,"    mov [rbp - %d], rax", ptr_off);
+                }
+            }
+            break;
+        }
+
         if (decl == TYPE_STRUCT) {
             TypeInfo *ti = stmt->data.let.type_info;
-            if (!ti) error_at(stmt->line, stmt->column, "struct declaration needs type info");
+            if (!ti) error_at(ERR_TYPE, stmt->line, stmt->column, "struct declaration needs type info");
             codegen_add_var(cg, stmt->data.let.var_name, TYPE_STRUCT,
                             stmt->data.let.is_mut, ti);
             int idx = cg->var_count - 1;
             int off = cg->var_offsets[idx];
             StructDef *sd = struct_find(cg, ti->struct_name);
-            if (!sd) error_at(stmt->line, stmt->column,
+            if (!sd) error_at(ERR_TYPE, stmt->line, stmt->column,
                               "unknown struct '%s'", ti->struct_name);
             if (val->type == AST_STRUCT_LITERAL) {
                 codegen_emit(cg,"    lea rbx, [rbp - %d]", off);
@@ -2244,7 +4030,7 @@ void codegen_statement(CodeGen *cg, ASTNode *stmt) {
 
         if (decl == TYPE_TUPLE) {
             TypeInfo *ti = stmt->data.let.type_info;
-            if (!ti) error_at(stmt->line, stmt->column, "tuple needs type info");
+            if (!ti) error_at(ERR_TYPE, stmt->line, stmt->column, "tuple needs type info");
             codegen_add_var(cg, stmt->data.let.var_name, TYPE_TUPLE,
                             stmt->data.let.is_mut, ti);
             int off = cg->var_offsets[cg->var_count-1];
@@ -2304,6 +4090,35 @@ void codegen_statement(CodeGen *cg, ASTNode *stmt) {
     }
 
     /* -- assign -- */
+    case AST_DEREF_ASSIGN: {
+        /* *ptr = val — load the raw pointer address, then store value there.
+         * Special case: if ptr_expr is a ref param, we must NOT auto-deref —
+         * the ref param's stack slot holds the address we need. */
+        ASTNode *ptr_expr = stmt->data.deref_assign.ptr_expr;
+        bool ptr_is_ref = false;
+        if (ptr_expr->type == AST_IDENTIFIER) {
+            int _idx = codegen_find_var(cg, ptr_expr->data.identifier);
+            if (_idx >= 0) {
+                TypeInfo *_ti = cg->var_typeinfo[_idx];
+                if (_ti && _ti->is_ref) {
+                    codegen_emit(cg,"    mov rax, [rbp - %d]", cg->var_offsets[_idx]);
+                    ptr_is_ref = true;
+                }
+            }
+        }
+        if (!ptr_is_ref) codegen_expression(cg, ptr_expr);
+        codegen_emit(cg,"    push rax");          /* save ptr address */
+        ValueType vt = codegen_expression(cg, stmt->data.deref_assign.value);
+        if (is_float(vt)) {
+            if (vt==TYPE_F32) codegen_emit(cg,"    cvtss2sd xmm0, xmm0");
+            codegen_emit(cg,"    movq rax, xmm0");
+        }
+        codegen_emit(cg,"    mov rbx, rax");      /* rbx = value */
+        codegen_emit(cg,"    pop rax");           /* rax = ptr address */
+        codegen_emit(cg,"    mov [rax], rbx");    /* *ptr = value */
+        break;
+    }
+
     case AST_ASSIGN: {
         /* _ discard: just evaluate for side effects */
         if (strcmp(stmt->data.assign.var_name, "_discard") == 0) {
@@ -2311,13 +4126,13 @@ void codegen_statement(CodeGen *cg, ASTNode *stmt) {
             break;
         }
         int idx = codegen_find_var(cg, stmt->data.assign.var_name);
-        if (idx < 0) error_at(stmt->line, stmt->column,
+        if (idx < 0) error_at(ERR_TYPE, stmt->line, stmt->column,
                                "undefined variable '%s'", stmt->data.assign.var_name);
         if (!cg->var_mutable[idx]) {
             TypeInfo *ati = cg->var_typeinfo[idx];
             bool ref_ok = ati && ati->is_ref;
             if (!ref_ok)
-                error_at(stmt->line, stmt->column,
+                error_at(ERR_TYPE, stmt->line, stmt->column,
                          "cannot assign to immutable variable '%s'",
                          stmt->data.assign.var_name);
         }
@@ -2334,6 +4149,14 @@ void codegen_statement(CodeGen *cg, ASTNode *stmt) {
             if (decl==TYPE_F32) codegen_emit(cg,"    movss [rbx], xmm0");
             else if (decl==TYPE_F64) codegen_emit(cg,"    movsd [rbx], xmm0");
             else codegen_emit(cg,"    mov [rbx], rax");
+        } else if (dti && dti->is_ref && decl == TYPE_ARRAY && dti->array_len < 0) {
+            codegen_emit(cg,"    mov rbx, [rbp - %d]", off);
+            codegen_emit(cg,"    mov [rbx], rax");
+        } else if (dti && dti->is_ref && is_composite(decl)) {
+            int sz = typeinfo_size(cg, decl, dti);
+            codegen_emit(cg,"    mov rbx, [rbp - %d]", off);
+            codegen_emit(cg,"    mov rdx, rax");
+            emit_copy_bytes_x86(cg, "rbx", "rdx", sz);
         } else {
             if (decl==TYPE_F32) codegen_emit(cg,"    movss [rbp - %d], xmm0", off);
             else if (decl==TYPE_F64) codegen_emit(cg,"    movsd [rbp - %d], xmm0", off);
@@ -2345,14 +4168,14 @@ void codegen_statement(CodeGen *cg, ASTNode *stmt) {
     /* -- compound assign +=, -=, *=, /=, %=, &=, |=, ^=, <<=, >>= -- */
     case AST_COMPOUND_ASSIGN: {
         int idx = codegen_find_var(cg, stmt->data.compound_assign.var_name);
-        if (idx < 0) error_at(stmt->line, stmt->column,
+        if (idx < 0) error_at(ERR_TYPE, stmt->line, stmt->column,
                                "undefined variable '%s'",
                                stmt->data.compound_assign.var_name);
         TypeInfo *dti = cg->var_typeinfo[idx];
         bool is_ref_var = dti && dti->is_ref;
         /* ref params are always mutable (the caller chose to pass by ref) */
         if (!cg->var_mutable[idx] && !is_ref_var)
-            error_at(stmt->line, stmt->column,
+            error_at(ERR_TYPE, stmt->line, stmt->column,
                      "cannot assign to immutable '%s'",
                      stmt->data.compound_assign.var_name);
         ValueType decl = cg->var_types[idx];
@@ -2472,23 +4295,49 @@ void codegen_statement(CodeGen *cg, ASTNode *stmt) {
 
     /* -- field assign: s.field = expr  OR  s.f1.f2 = expr (chained) -- */
     case AST_FIELD_ASSIGN: {
+        if (stmt->data.field_assign.target) {
+            ValueType expect = infer_expr_type(cg, stmt->data.field_assign.target);
+            TypeInfo *fti = expr_typeinfo(cg, stmt->data.field_assign.target);
+            emit_lvalue_addr_x86(cg, stmt->data.field_assign.target);
+            codegen_emit(cg,"    push rax");
+            ValueType vt = codegen_expression(cg, stmt->data.field_assign.value);
+            codegen_emit(cg,"    pop rbx");
+            validate_unsigned_literal_range(stmt->data.field_assign.value, expect,
+                                            stmt->line, stmt->column);
+            if (vt != expect) codegen_cast(cg, vt, expect);
+            if (is_generic_struct_slot(expect, fti)) {
+                if (vt == TYPE_STRUCT || vt == TYPE_TUPLE)
+                    error_at(ERR_TYPE, stmt->line, stmt->column,
+                             "generic field assignment does not support composite values yet");
+                if (vt == TYPE_F32) codegen_emit(cg,"    cvtss2sd xmm0, xmm0");
+                if (is_float(vt)) codegen_emit(cg,"    movq rax, xmm0");
+                codegen_emit(cg,"    mov [rbx], rax");
+            } else if (expect==TYPE_F32) {
+                codegen_emit(cg,"    movss [rbx], xmm0");
+            } else if (expect==TYPE_F64) {
+                codegen_emit(cg,"    movsd [rbx], xmm0");
+            } else {
+                codegen_emit(cg,"    mov [rbx], rax");
+            }
+            break;
+        }
         /* The field_name may contain dots for chained access: "pos.x" means
            first navigate to field "pos" (which must be a struct), then assign "x". */
         int idx = codegen_find_var(cg, stmt->data.field_assign.var_name);
-        if (idx < 0) error_at(stmt->line, stmt->column,
+        if (idx < 0) error_at(ERR_TYPE, stmt->line, stmt->column,
                                "undefined variable '%s'",
                                stmt->data.field_assign.var_name);
-        if (!cg->var_mutable[idx])
-            error_at(stmt->line, stmt->column,
+        if (!cg->var_mutable[idx] && !(cg->var_typeinfo[idx] && cg->var_typeinfo[idx]->is_ref))
+            error_at(ERR_TYPE, stmt->line, stmt->column,
                      "cannot assign to immutable '%s'",
                      stmt->data.field_assign.var_name);
         if (cg->var_types[idx] != TYPE_STRUCT)
-            error_at(stmt->line, stmt->column,
+            error_at(ERR_TYPE, stmt->line, stmt->column,
                      "'%s' is not a struct", stmt->data.field_assign.var_name);
 
         /* Split field_name on '.' into segments */
         char chain_buf[MAX_TOKEN_LEN];
-        strncpy(chain_buf, stmt->data.field_assign.field_name, MAX_TOKEN_LEN-1);
+        vl_strncpy(chain_buf, stmt->data.field_assign.field_name, MAX_TOKEN_LEN);
         char *segments[16];
         int seg_count = 0;
         char *tok2 = strtok(chain_buf, ".");
@@ -2499,11 +4348,11 @@ void codegen_statement(CodeGen *cg, ASTNode *stmt) {
 
         TypeInfo *ti = cg->var_typeinfo[idx];
         StructDef *sd = struct_find(cg, ti->struct_name);
-        if (!sd) error("unknown struct");
+        if (!sd) error(ERR_TYPE, "unknown struct");
         struct_size(cg, sd);
 
         /* Emit base struct address */
-        if (ti->by_ref)
+        if (ti->by_ref || ti->is_ref)
             codegen_emit(cg,"    mov rbx, [rbp - %d]", cg->var_offsets[idx]);
         else
             codegen_emit(cg,"    lea rbx, [rbp - %d]", cg->var_offsets[idx]);
@@ -2512,31 +4361,41 @@ void codegen_statement(CodeGen *cg, ASTNode *stmt) {
         for (int si = 0; si < seg_count - 1; si++) {
             int fidx2 = struct_field_index(sd, segments[si]);
             if (fidx2 < 0)
-                error_at(stmt->line, stmt->column,
+                error_at(ERR_TYPE, stmt->line, stmt->column,
                          "unknown field '%s' on '%s'", segments[si], sd->name);
-            if (sd->field_types[fidx2] != TYPE_STRUCT)
-                error_at(stmt->line, stmt->column,
+            TypeInfo *fti2 = sd->field_typeinfo ? sd->field_typeinfo[fidx2] : NULL;
+            if (sd->field_types[fidx2] != TYPE_STRUCT || is_generic_struct_slot(sd->field_types[fidx2], fti2))
+                error_at(ERR_TYPE, stmt->line, stmt->column,
                          "field '%s' is not a struct", segments[si]);
             struct_size(cg, sd);
             codegen_emit(cg,"    add rbx, %d", sd->field_offsets[fidx2]);
-            TypeInfo *fti2 = sd->field_typeinfo ? sd->field_typeinfo[fidx2] : NULL;
-            if (!fti2) error("struct field missing type info");
+            if (!fti2) error(ERR_CODEGEN, "struct field missing type info");
             sd = struct_find(cg, fti2->struct_name);
-            if (!sd) error("unknown struct '%s'", fti2->struct_name);
+            if (!sd) error(ERR_TYPE, "unknown struct '%s'", fti2->struct_name);
             struct_size(cg, sd);
         }
 
         /* Final field */
         const char *last_field = segments[seg_count - 1];
         int fidx = struct_field_index(sd, last_field);
-        if (fidx < 0) error_at(stmt->line, stmt->column,
+        if (fidx < 0) error_at(ERR_TYPE, stmt->line, stmt->column,
                                 "unknown field '%s' on '%s'", last_field, sd->name);
         int foff = sd->field_offsets[fidx];
         ValueType expect = sd->field_types[fidx];
+        TypeInfo *fti = sd->field_typeinfo ? sd->field_typeinfo[fidx] : NULL;
 
         codegen_emit(cg,"    push rbx");
         ValueType vt = codegen_expression(cg, stmt->data.field_assign.value);
         codegen_emit(cg,"    pop rbx");
+        if (is_generic_struct_slot(expect, fti)) {
+            if (vt == TYPE_STRUCT || vt == TYPE_TUPLE)
+                error_at(ERR_TYPE, stmt->line, stmt->column,
+                         "generic field assignment does not support composite values yet");
+            if (vt == TYPE_F32) codegen_emit(cg,"    cvtss2sd xmm0, xmm0");
+            if (is_float(vt)) codegen_emit(cg,"    movq rax, xmm0");
+            codegen_emit(cg,"    mov [rbx + %d], rax", foff);
+            break;
+        }
         validate_unsigned_literal_range(stmt->data.field_assign.value, expect,
                                         stmt->line, stmt->column);
         if (vt != expect) codegen_cast(cg, vt, expect);
@@ -2546,21 +4405,149 @@ void codegen_statement(CodeGen *cg, ASTNode *stmt) {
         break;
     }
 
+    case AST_FIELD_COMPOUND_ASSIGN: {
+        int idx = codegen_find_var(cg, stmt->data.field_compound_assign.var_name);
+        if (idx < 0) error_at(ERR_TYPE, stmt->line, stmt->column,
+                               "undefined variable '%s'",
+                               stmt->data.field_compound_assign.var_name);
+        if (!cg->var_mutable[idx] && !(cg->var_typeinfo[idx] && cg->var_typeinfo[idx]->is_ref))
+            error_at(ERR_TYPE, stmt->line, stmt->column,
+                     "cannot assign to immutable '%s'",
+                     stmt->data.field_compound_assign.var_name);
+        if (cg->var_types[idx] != TYPE_STRUCT)
+            error_at(ERR_TYPE, stmt->line, stmt->column,
+                     "'%s' is not a struct", stmt->data.field_compound_assign.var_name);
+
+        char chain_buf[MAX_TOKEN_LEN];
+        vl_strncpy(chain_buf, stmt->data.field_compound_assign.field_name, MAX_TOKEN_LEN);
+        char *segments[16];
+        int seg_count = 0;
+        char *tok2 = strtok(chain_buf, ".");
+        while (tok2 && seg_count < 16) {
+            segments[seg_count++] = tok2;
+            tok2 = strtok(NULL, ".");
+        }
+
+        TypeInfo *ti = cg->var_typeinfo[idx];
+        StructDef *sd = struct_find(cg, ti->struct_name);
+        if (!sd) error(ERR_TYPE, "unknown struct");
+        struct_size(cg, sd);
+
+        if (ti->by_ref || ti->is_ref)
+            codegen_emit(cg,"    mov rbx, [rbp - %d]", cg->var_offsets[idx]);
+        else
+            codegen_emit(cg,"    lea rbx, [rbp - %d]", cg->var_offsets[idx]);
+
+        for (int si = 0; si < seg_count - 1; si++) {
+            int fidx2 = struct_field_index(sd, segments[si]);
+            if (fidx2 < 0)
+                error_at(ERR_TYPE, stmt->line, stmt->column,
+                         "unknown field '%s' on '%s'", segments[si], sd->name);
+            TypeInfo *fti2 = sd->field_typeinfo ? sd->field_typeinfo[fidx2] : NULL;
+            if (sd->field_types[fidx2] != TYPE_STRUCT || is_generic_struct_slot(sd->field_types[fidx2], fti2))
+                error_at(ERR_TYPE, stmt->line, stmt->column,
+                         "field '%s' is not a struct", segments[si]);
+            codegen_emit(cg,"    add rbx, %d", sd->field_offsets[fidx2]);
+            if (!fti2) error(ERR_CODEGEN, "struct field missing type info");
+            sd = struct_find(cg, fti2->struct_name);
+            if (!sd) error(ERR_TYPE, "unknown struct '%s'", fti2->struct_name);
+            struct_size(cg, sd);
+        }
+
+        const char *last_field = segments[seg_count - 1];
+        int fidx = struct_field_index(sd, last_field);
+        if (fidx < 0) error_at(ERR_TYPE, stmt->line, stmt->column,
+                                "unknown field '%s' on '%s'", last_field, sd->name);
+        int foff = sd->field_offsets[fidx];
+        ValueType expect = sd->field_types[fidx];
+        TypeInfo *fti = sd->field_typeinfo ? sd->field_typeinfo[fidx] : NULL;
+        BinaryOp op = stmt->data.field_compound_assign.op;
+
+        bool generic_scalar_slot = is_generic_struct_slot(expect, fti);
+
+        codegen_emit(cg,"    lea rcx, [rbx + %d]", foff);
+        codegen_emit(cg,"    push rcx");
+        ValueType vt = codegen_expression(cg, stmt->data.field_compound_assign.value);
+        codegen_emit(cg,"    pop rsi");
+
+        if ((!is_float(expect) && !is_float(vt)) || (generic_scalar_slot && !is_float(vt))) {
+            validate_unsigned_literal_range(stmt->data.field_compound_assign.value, expect,
+                                            stmt->line, stmt->column);
+            if (!generic_scalar_slot && vt != expect) codegen_cast(cg, vt, expect);
+            codegen_emit(cg,"    mov rbx, rax");
+            codegen_emit(cg,"    mov rax, [rsi]");
+            switch (op) {
+            case OP_ADD:  codegen_emit(cg,"    add  rax, rbx"); break;
+            case OP_SUB:  codegen_emit(cg,"    sub  rax, rbx"); break;
+            case OP_MUL:  codegen_emit(cg,"    imul rax, rbx"); break;
+            case OP_DIV:  codegen_emit(cg,"    cqo"); codegen_emit(cg,"    idiv rbx"); break;
+            case OP_MOD:  codegen_emit(cg,"    cqo"); codegen_emit(cg,"    idiv rbx");
+                          codegen_emit(cg,"    mov rax, rdx"); break;
+            case OP_BAND: codegen_emit(cg,"    and  rax, rbx"); break;
+            case OP_BOR:  codegen_emit(cg,"    or   rax, rbx"); break;
+            case OP_BXOR: codegen_emit(cg,"    xor  rax, rbx"); break;
+            case OP_SHL:  codegen_emit(cg,"    mov rcx, rbx");
+                          codegen_emit(cg,"    shl  rax, cl");  break;
+            case OP_SHR:  codegen_emit(cg,"    mov rcx, rbx");
+                          codegen_emit(cg,"    sar  rax, cl");  break;
+            default: break;
+            }
+            codegen_emit(cg,"    mov [rsi], rax");
+        } else {
+            if (expect == TYPE_F32) {
+                if (is_float(vt)) {
+                    if (vt == TYPE_F64) codegen_emit(cg,"    cvtsd2ss xmm0, xmm0");
+                } else {
+                    codegen_emit(cg,"    cvtsi2ss xmm0, rax");
+                }
+                codegen_emit(cg,"    movss xmm1, [rsi]");
+                switch (op) {
+                case OP_ADD: codegen_emit(cg,"    addss xmm1, xmm0"); break;
+                case OP_SUB: codegen_emit(cg,"    subss xmm1, xmm0"); break;
+                case OP_MUL: codegen_emit(cg,"    mulss xmm1, xmm0"); break;
+                case OP_DIV: codegen_emit(cg,"    divss xmm1, xmm0"); break;
+                default:
+                    error_at(ERR_TYPE, stmt->line, stmt->column,
+                             "operator not supported for float field compound assignment");
+                }
+                codegen_emit(cg,"    movss [rsi], xmm1");
+            } else {
+                if (is_float(vt)) {
+                    if (vt == TYPE_F32) codegen_emit(cg,"    cvtss2sd xmm0, xmm0");
+                } else {
+                    codegen_emit(cg,"    cvtsi2sd xmm0, rax");
+                }
+                codegen_emit(cg,"    movsd xmm1, [rsi]");
+                switch (op) {
+                case OP_ADD: codegen_emit(cg,"    addsd xmm1, xmm0"); break;
+                case OP_SUB: codegen_emit(cg,"    subsd xmm1, xmm0"); break;
+                case OP_MUL: codegen_emit(cg,"    mulsd xmm1, xmm0"); break;
+                case OP_DIV: codegen_emit(cg,"    divsd xmm1, xmm0"); break;
+                default:
+                    error_at(ERR_TYPE, stmt->line, stmt->column,
+                             "operator not supported for float field compound assignment");
+                }
+                codegen_emit(cg,"    movsd [rsi], xmm1");
+            }
+        }
+        break;
+    }
+
     /* -- array element assign: arr[i] = v -- */
     case AST_ARRAY_ASSIGN: {
         int idx = codegen_find_var(cg, stmt->data.array_assign.var_name);
-        if (idx < 0) error_at(stmt->line, stmt->column,
+        if (idx < 0) error_at(ERR_TYPE, stmt->line, stmt->column,
                                "undefined variable '%s'",
                                stmt->data.array_assign.var_name);
         if (!cg->var_mutable[idx])
-            error_at(stmt->line, stmt->column,
+            error_at(ERR_TYPE, stmt->line, stmt->column,
                      "cannot assign to immutable '%s'",
                      stmt->data.array_assign.var_name);
         if (cg->var_types[idx] != TYPE_ARRAY)
-            error_at(stmt->line, stmt->column,
+            error_at(ERR_TYPE, stmt->line, stmt->column,
                      "'%s' is not an array", stmt->data.array_assign.var_name);
         TypeInfo *ti = cg->var_typeinfo[idx];
-        if (!ti) error("array missing type info");
+        if (!ti) error(ERR_CODEGEN, "array missing type info");
         ValueType elem = ti->elem_type;
         int elem_size  = array_elem_size(cg, ti);
         int var_off    = cg->var_offsets[idx];
@@ -2570,7 +4557,11 @@ void codegen_statement(CodeGen *cg, ASTNode *stmt) {
         if (it != TYPE_INT) codegen_cast(cg, it, TYPE_INT);
         codegen_emit(cg,"    mov rcx, rax");
 
-        if (ti->by_ref || ti->array_len < 0)
+        if (ti->is_ref) {
+            codegen_emit(cg,"    mov rbx, [rbp - %d]", var_off);
+            if (ti->array_len < 0)
+                codegen_emit(cg,"    mov rbx, [rbx]");
+        } else if (ti->by_ref || ti->array_len < 0)
             codegen_emit(cg,"    mov rbx, [rbp - %d]", var_off);
         else
             codegen_emit(cg,"    lea rbx, [rbp - %d]", var_off);
@@ -2602,7 +4593,12 @@ void codegen_statement(CodeGen *cg, ASTNode *stmt) {
 
         /* For dynamic arrays, update length if this index >= current length */
         if (ti->array_len < 0) {
-            codegen_emit(cg,"    mov rbx, [rbp - %d]", var_off);
+            if (ti->is_ref) {
+                codegen_emit(cg,"    mov rbx, [rbp - %d]", var_off);
+                codegen_emit(cg,"    mov rbx, [rbx]");
+            } else {
+                codegen_emit(cg,"    mov rbx, [rbp - %d]", var_off);
+            }
             codegen_emit(cg,"    mov rax, [rbx - 8]");
             codegen_emit(cg,"    cmp rcx, rax");
             codegen_emit(cg,"    jl  .skip_len_upd_%d", cg->label_counter);
@@ -2616,24 +4612,110 @@ void codegen_statement(CodeGen *cg, ASTNode *stmt) {
 
     /* -- append -- */
     case AST_APPEND: {
-        int idx = codegen_find_var(cg, stmt->data.append_stmt.arr_name);
-        if (idx < 0) error_at(stmt->line, stmt->column,
-                               "undefined variable '%s'",
-                               stmt->data.append_stmt.arr_name);
+        const char *base_name = stmt->data.append_stmt.arr_name;
+        const char *field_chain = stmt->data.append_stmt.field_chain;
+
+        int idx = codegen_find_var(cg, base_name);
+        if (idx < 0)
+            error_at(ERR_TYPE, stmt->line, stmt->column,
+                     "undefined variable '%s'", base_name);
         if (!cg->var_mutable[idx])
-            error_at(stmt->line, stmt->column,
-                     "cannot append to immutable '%s'",
-                     stmt->data.append_stmt.arr_name);
-        TypeInfo *ti = cg->var_typeinfo[idx];
-        if (!ti || ti->array_len >= 0)
-            error_at(stmt->line, stmt->column,
-                     "append() only works on dynamic arrays (ath mut arr: [type] = [])");
+            error_at(ERR_TYPE, stmt->line, stmt->column,
+                     "cannot append to immutable '%s'", base_name);
+
+        /* Resolve target array type info and compute address of the array slot
+           (a stack/local slot or a struct field) into ARG1. */
+        TypeInfo *ti = NULL;
+        if (!field_chain || field_chain[0] == '\0') {
+            ti = cg->var_typeinfo[idx];
+            if (!ti || ti->array_len >= 0)
+                error_at(ERR_TYPE, stmt->line, stmt->column,
+                         "append() only works on dynamic arrays (ath mut arr: [type] = [])");
+        } else {
+            /* struct.field(.field...).append(val); */
+            if (cg->var_types[idx] != TYPE_STRUCT)
+                error_at(ERR_TYPE, stmt->line, stmt->column,
+                         "'%s' is not a struct", base_name);
+            TypeInfo *sti = cg->var_typeinfo[idx];
+            if (!sti) error(ERR_CODEGEN, "struct missing type info");
+            StructDef *sd = struct_find(cg, sti->struct_name);
+            if (!sd) error(ERR_TYPE, "unknown struct '%s'", sti->struct_name);
+            struct_size(cg, sd);
+
+            /* rbx = base struct address */
+            if (sti->by_ref || sti->is_ref)
+                codegen_emit(cg,"    mov rbx, [rbp - %d]", cg->var_offsets[idx]);
+            else
+                codegen_emit(cg,"    lea rbx, [rbp - %d]", cg->var_offsets[idx]);
+
+            char chain_copy[MAX_TOKEN_LEN];
+            vl_strncpy(chain_copy, field_chain, sizeof(chain_copy));
+            char *saveptr = NULL;
+            char *tok = strtok_r(chain_copy, ".", &saveptr);
+            while (tok) {
+                char *next = strtok_r(NULL, ".", &saveptr);
+                int fidx = struct_field_index(sd, tok);
+                if (fidx < 0)
+                    error_at(ERR_TYPE, stmt->line, stmt->column,
+                             "unknown field '%s' in '%s'", tok, sd->name);
+                struct_size(cg, sd);
+                if (next) {
+                    if (sd->field_types[fidx] != TYPE_STRUCT)
+                        error_at(ERR_TYPE, stmt->line, stmt->column,
+                                 "field '%s' is not a struct", tok);
+                    TypeInfo *fti = sd->field_typeinfo ? sd->field_typeinfo[fidx] : NULL;
+                    if (!fti) error(ERR_CODEGEN, "struct field missing type info");
+                    StructDef *child = struct_find(cg, fti->struct_name);
+                    if (!child) error(ERR_TYPE, "unknown struct '%s'", fti->struct_name);
+                    codegen_emit(cg,"    add rbx, %d", sd->field_offsets[fidx]);
+                    sd = child;
+                    tok = next;
+                    continue;
+                }
+                /* final token: must be an array field */
+                if (sd->field_types[fidx] != TYPE_ARRAY)
+                    error_at(ERR_TYPE, stmt->line, stmt->column,
+                             "field '%s' is not an array", tok);
+                ti = sd->field_typeinfo ? sd->field_typeinfo[fidx] : NULL;
+                if (!ti)
+                    error_at(ERR_CODEGEN, stmt->line, stmt->column,
+                             "array field missing type info");
+                if (ti->array_len >= 0)
+                    error_at(ERR_TYPE, stmt->line, stmt->column,
+                             "append() only works on dynamic arrays");
+                /* rbx currently points to the struct; the array slot lives at offset */
+                if (cg->target_windows)
+                    codegen_emit(cg,"    lea rcx, [rbx + %d]", sd->field_offsets[fidx]);
+                else
+                    codegen_emit(cg,"    lea rdi, [rbx + %d]", sd->field_offsets[fidx]);
+                break;
+            }
+        }
+
         cg->needs_arr_alloc   = true;
         cg->needs_arr_append  = true;
         int elem_size = array_elem_size(cg, ti);
 
         /* evaluate value */
-        ValueType vt = codegen_expression(cg, stmt->data.append_stmt.value);
+        ValueType vt;
+        if (ti->elem_type == TYPE_STRUCT &&
+            stmt->data.append_stmt.value->type == AST_STRUCT_LITERAL) {
+            if (!ti->elem_typeinfo)
+                error_at(ERR_TYPE, stmt->line, stmt->column,
+                         "array element missing struct type info");
+            StructDef *sd = struct_find(cg, ti->elem_typeinfo->struct_name);
+            if (!sd) error(ERR_TYPE, "unknown struct '%s'", ti->elem_typeinfo->struct_name);
+            char tmpn[32];
+            snprintf(tmpn, sizeof(tmpn), "_append%d", codegen_new_label(cg));
+            codegen_add_var(cg, tmpn, TYPE_STRUCT, true, typeinfo_clone(ti->elem_typeinfo));
+            int tmp_off = cg->var_offsets[cg->var_count - 1];
+            codegen_emit(cg,"    lea rbx, [rbp - %d]", tmp_off);
+            codegen_emit_struct_literal(cg, sd, stmt->data.append_stmt.value);
+            codegen_emit(cg,"    lea rax, [rbp - %d]", tmp_off);
+            vt = TYPE_STRUCT;
+        } else {
+            vt = codegen_expression(cg, stmt->data.append_stmt.value);
+        }
         validate_unsigned_literal_range(stmt->data.append_stmt.value, ti->elem_type,
                                         stmt->line, stmt->column);
         if (vt != ti->elem_type) codegen_cast(cg, vt, ti->elem_type);
@@ -2647,12 +4729,22 @@ void codegen_statement(CodeGen *cg, ASTNode *stmt) {
         /* call __vl_arr_append(&arr_slot, value-or-src-ptr, elem_size) */
         codegen_emit(cg,"    push rax");   /* save value or struct source pointer */
         if (cg->target_windows) {
-            codegen_emit(cg,"    lea rcx, [rbp - %d]", cg->var_offsets[idx]);
+            if (!field_chain || field_chain[0] == '\0') {
+                if (ti->is_ref)
+                    codegen_emit(cg,"    mov rcx, [rbp - %d]", cg->var_offsets[idx]);
+                else
+                    codegen_emit(cg,"    lea rcx, [rbp - %d]", cg->var_offsets[idx]);
+            }
             codegen_emit(cg,"    pop rdx");
             codegen_emit(cg,"    mov r8, %d", elem_size);
             codegen_emit(cg,"    sub rsp, 32");
         } else {
-            codegen_emit(cg,"    lea rdi, [rbp - %d]", cg->var_offsets[idx]);
+            if (!field_chain || field_chain[0] == '\0') {
+                if (ti->is_ref)
+                    codegen_emit(cg,"    mov rdi, [rbp - %d]", cg->var_offsets[idx]);
+                else
+                    codegen_emit(cg,"    lea rdi, [rbp - %d]", cg->var_offsets[idx]);
+            }
             codegen_emit(cg,"    pop rsi");
             codegen_emit(cg,"    mov rdx, %d", elem_size);
         }
@@ -2669,12 +4761,18 @@ void codegen_statement(CodeGen *cg, ASTNode *stmt) {
         if (is_float(ct)) codegen_cast(cg, ct, TYPE_INT);
         codegen_emit(cg,"    cmp rax, 0");
         codegen_emit(cg,"    je  _VL%d", else_l);
-        for (int i = 0; i < stmt->data.if_stmt.then_count; i++)
-            codegen_statement(cg, stmt->data.if_stmt.then_stmts[i]);
+        { int sv = cg->var_count;
+          for (int i = 0; i < stmt->data.if_stmt.then_count; i++)
+              codegen_statement(cg, stmt->data.if_stmt.then_stmts[i]);
+          for (int _i = sv; _i < cg->var_count; _i++) { free(cg->local_vars[_i]); cg->local_vars[_i] = NULL; }
+          cg->var_count = sv; }
         codegen_emit(cg,"    jmp _VL%d", end_l);
         codegen_emit(cg,"_VL%d:", else_l);
-        for (int i = 0; i < stmt->data.if_stmt.else_count; i++)
-            codegen_statement(cg, stmt->data.if_stmt.else_stmts[i]);
+        { int sv = cg->var_count;
+          for (int i = 0; i < stmt->data.if_stmt.else_count; i++)
+              codegen_statement(cg, stmt->data.if_stmt.else_stmts[i]);
+          for (int _i = sv; _i < cg->var_count; _i++) { free(cg->local_vars[_i]); cg->local_vars[_i] = NULL; }
+          cg->var_count = sv; }
         codegen_emit(cg,"_VL%d:", end_l);
         break;
     }
@@ -2689,8 +4787,11 @@ void codegen_statement(CodeGen *cg, ASTNode *stmt) {
         codegen_emit(cg,"    cmp rax, 0");
         codegen_emit(cg,"    je  _VL%d", end_l);
         loop_push(cg, start_l, end_l);
-        for (int i = 0; i < stmt->data.while_stmt.body_count; i++)
-            codegen_statement(cg, stmt->data.while_stmt.body[i]);
+        { int sv = cg->var_count;
+          for (int i = 0; i < stmt->data.while_stmt.body_count; i++)
+              codegen_statement(cg, stmt->data.while_stmt.body[i]);
+          for (int _i = sv; _i < cg->var_count; _i++) { free(cg->local_vars[_i]); cg->local_vars[_i] = NULL; }
+          cg->var_count = sv; }
         loop_pop(cg);
         codegen_emit(cg,"    jmp _VL%d", start_l);
         codegen_emit(cg,"_VL%d:", end_l);
@@ -2699,6 +4800,7 @@ void codegen_statement(CodeGen *cg, ASTNode *stmt) {
 
     /* -- for(;;) -- */
     case AST_FOR: {
+        int saved_for = cg->var_count;
         if (stmt->data.for_stmt.init)
             codegen_statement(cg, stmt->data.for_stmt.init);
         int start_l = codegen_new_label(cg);
@@ -2712,14 +4814,29 @@ void codegen_statement(CodeGen *cg, ASTNode *stmt) {
             codegen_emit(cg,"    je  _VL%d", end_l);
         }
         loop_push(cg, cont_l, end_l);
-        for (int i = 0; i < stmt->data.for_stmt.body_count; i++)
-            codegen_statement(cg, stmt->data.for_stmt.body[i]);
+        { int sv = cg->var_count;
+          for (int i = 0; i < stmt->data.for_stmt.body_count; i++)
+              codegen_statement(cg, stmt->data.for_stmt.body[i]);
+          for (int _i = sv; _i < cg->var_count; _i++) { free(cg->local_vars[_i]); cg->local_vars[_i] = NULL; }
+          cg->var_count = sv; }
         loop_pop(cg);
         codegen_emit(cg,"_VL%d:", cont_l);
         if (stmt->data.for_stmt.post)
             codegen_statement(cg, stmt->data.for_stmt.post);
         codegen_emit(cg,"    jmp _VL%d", start_l);
         codegen_emit(cg,"_VL%d:", end_l);
+        for (int _i = saved_for; _i < cg->var_count; _i++) { free(cg->local_vars[_i]); cg->local_vars[_i] = NULL; }
+        cg->var_count = saved_for;
+        break;
+    }
+
+    /* -- bare scoped block -- */
+    case AST_BLOCK: {
+        int sv = cg->var_count;
+        for (int i = 0; i < stmt->data.block_stmt.count; i++)
+            codegen_statement(cg, stmt->data.block_stmt.stmts[i]);
+        for (int _i = sv; _i < cg->var_count; _i++) { free(cg->local_vars[_i]); cg->local_vars[_i] = NULL; }
+        cg->var_count = sv;
         break;
     }
 
@@ -2780,14 +4897,14 @@ void codegen_statement(CodeGen *cg, ASTNode *stmt) {
         if (iter && iter->type == AST_IDENTIFIER) {
             arr_idx = codegen_find_var(cg, iter->data.identifier);
             if (arr_idx < 0)
-                error_at(stmt->line, stmt->column,
+                error_at(ERR_TYPE, stmt->line, stmt->column,
                          "undefined variable '%s'", iter->data.identifier);
             ti = cg->var_typeinfo[arr_idx];
         } else if (iter) {
             /* call returning array */
             ValueType rt = codegen_expression(cg, iter);
             if (rt != TYPE_ARRAY)
-                error_at(stmt->line, stmt->column, "for-in requires array");
+                error_at(ERR_TYPE, stmt->line, stmt->column, "for-in requires array");
             char arrname[32]; snprintf(arrname,32,"_farr%d",codegen_new_label(cg));
             FunctionSig *sig = NULL;
             if (iter->type == AST_CALL) sig = func_sig_find(cg, iter->data.call.func_name);
@@ -2799,7 +4916,7 @@ void codegen_statement(CodeGen *cg, ASTNode *stmt) {
                 sig = func_sig_find(cg, fn);
             }
             if (!sig || !sig->return_typeinfo)
-                error_at(stmt->line, stmt->column,
+                error_at(ERR_TYPE, stmt->line, stmt->column,
                          "for-in call must return typed array");
             TypeInfo *arr_ti = typeinfo_clone(sig->return_typeinfo);
             codegen_add_var(cg, arrname, TYPE_ARRAY, true, arr_ti);
@@ -2807,7 +4924,7 @@ void codegen_statement(CodeGen *cg, ASTNode *stmt) {
             codegen_emit(cg,"    mov [rbp - %d], rax", cg->var_offsets[arr_idx]);
             ti = arr_ti;
         }
-        if (!ti) error_at(stmt->line, stmt->column, "for-in: missing type info");
+        if (!ti) error_at(ERR_CODEGEN, stmt->line, stmt->column, "for-in: missing type info");
         ValueType elem = ti->elem_type;
 
         char idxn[32], lenn[32];
@@ -2815,8 +4932,11 @@ void codegen_statement(CodeGen *cg, ASTNode *stmt) {
         snprintf(lenn,32,"_flen%d",codegen_new_label(cg));
 
         TypeInfo *elem_ti = NULL;
-        if (elem == TYPE_STRUCT && ti->elem_typeinfo)
-            elem_ti = typeinfo_ref(ti->elem_typeinfo);
+        if (elem == TYPE_STRUCT && ti->elem_typeinfo) {
+            /* The loop variable stores the struct value inline on the stack.
+               Do NOT mark it by_ref, otherwise field access will treat it as a pointer. */
+            elem_ti = typeinfo_clone(ti->elem_typeinfo);
+        }
         codegen_add_var(cg, stmt->data.for_in_stmt.var_name, elem, true, elem_ti);
         int var_idx = cg->var_count - 1;
         codegen_add_var(cg, idxn, TYPE_INT, true, NULL);
@@ -2842,10 +4962,10 @@ void codegen_statement(CodeGen *cg, ASTNode *stmt) {
 
         /* load element into loop var */
         codegen_emit(cg,"    mov rcx, [rbp - %d]", cg->var_offsets[idx_idx]);
-        if (ti->array_len < 0)
-            codegen_emit(cg,"    mov rbx, [rbp - %d]", cg->var_offsets[arr_idx]);
-        else
-            codegen_emit(cg,"    lea rbx, [rbp - %d]", cg->var_offsets[arr_idx]);
+        /* Arrays are represented as a pointer to the first element, with length at [ptr-8].
+           Even when the length is known at compile time (ti->array_len >= 0), the value
+           stored in the local slot is still a pointer, not inline array storage. */
+        codegen_emit(cg,"    mov rbx, [rbp - %d]", cg->var_offsets[arr_idx]);
 
         if (elem == TYPE_F32) {
             codegen_emit(cg,"    movss xmm0, [rbx + rcx*8]");
@@ -2854,15 +4974,16 @@ void codegen_statement(CodeGen *cg, ASTNode *stmt) {
             codegen_emit(cg,"    movsd xmm0, [rbx + rcx*8]");
             codegen_emit(cg,"    movsd [rbp - %d], xmm0", cg->var_offsets[var_idx]);
         } else if (elem == TYPE_STRUCT) {
-            /* store pointer to element */
+            /* copy the struct element into the loop variable slot */
             int es = array_elem_size(cg, ti);
             if (es == 8)
-                codegen_emit(cg,"    lea rax, [rbx + rcx*8]");
+                codegen_emit(cg,"    lea rdx, [rbx + rcx*8]");
             else {
                 codegen_emit(cg,"    imul rcx, %d", es);
-                codegen_emit(cg,"    lea rax, [rbx + rcx]");
+                codegen_emit(cg,"    lea rdx, [rbx + rcx]");
             }
-            codegen_emit(cg,"    mov [rbp - %d], rax", cg->var_offsets[var_idx]);
+            codegen_emit(cg,"    lea rax, [rbp - %d]", cg->var_offsets[var_idx]);
+            emit_copy_bytes_x86(cg, "rax", "rdx", es);
         } else {
             codegen_emit(cg,"    mov rax, [rbx + rcx*8]");
             codegen_emit(cg,"    mov [rbp - %d], rax", cg->var_offsets[var_idx]);
@@ -2920,14 +5041,12 @@ void codegen_statement(CodeGen *cg, ASTNode *stmt) {
 
     /* -- throw -- */
     case AST_THROW: {
-        /* Simple: treat as panic with string message */
         cg->needs_panic = true;
         ValueType vt = codegen_expression(cg, stmt->data.throw_stmt.value);
-        if (vt != TYPE_STRING) {
-            int sid = codegen_intern_string(cg, "error thrown");
-            codegen_emit(cg,"    lea rax, [rel _VL_str_%d]", sid);
-        }
+        /* rax = the thrown value (integer code or string pointer).
+           Only substitute a fallback string when panicking (no enclosing try). */
         if (cg->try_depth > 0) {
+            /* Inside try — store the raw value into the catch variable, then jump. */
             int top = cg->try_depth - 1;
             int catch_l = cg->try_catch_labels[top];
             int evar_off = cg->error_var_offsets[top];
@@ -2935,11 +5054,17 @@ void codegen_statement(CodeGen *cg, ASTNode *stmt) {
             codegen_emit(cg,"    sub qword [rel _VL_try_depth_rt], 1");
             codegen_emit(cg,"    jmp _VL%d", catch_l);
         } else {
+            /* No enclosing try in THIS function — save raw value first,
+               then pass a string to __vl_panic for the fatal message. */
+            codegen_emit(cg,"    mov [rel _VL_err_code], rax");  /* save raw */
+            if (vt != TYPE_STRING) {
+                int sid = codegen_intern_string(cg, "unhandled throw");
+                codegen_emit(cg,"    lea rax, [rel _VL_str_%d]", sid);
+            }
             codegen_emit(cg,"    mov %s, rax", arg_reg(cg, 0));
             if (cg->target_windows) codegen_emit(cg,"    sub rsp, 32");
             codegen_emit(cg,"    call __vl_panic");
             if (cg->target_windows) codegen_emit(cg,"    add rsp, 32");
-            /* If __vl_panic returns (inside an enclosing try), unwind this function. */
             codegen_emit(cg,"    xor rax, rax");
             codegen_emit(cg,"    mov rsp, rbp");
             codegen_emit(cg,"    pop rbp");
@@ -2960,7 +5085,7 @@ void codegen_statement(CodeGen *cg, ASTNode *stmt) {
         codegen_emit(cg,"    mov qword [rbp - %d], 0", evar_off);
 
         if (cg->try_depth >= 64)
-            error_at(stmt->line, stmt->column, "try/catch nesting too deep");
+            error_at(ERR_TYPE, stmt->line, stmt->column, "try/catch nesting too deep");
         cg->try_catch_labels[cg->try_depth] = catch_l;
         cg->error_var_offsets[cg->try_depth] = evar_off;
         cg->try_depth++;
@@ -2983,12 +5108,18 @@ void codegen_statement(CodeGen *cg, ASTNode *stmt) {
         break;
     }
 
+    /* -- saabit constant declaration: no-op (value stored at parse time) -- */
+    case AST_CONST_DECL:
+        break;
+
     /* -- expression statement -- */
     default:
         codegen_expression(cg, stmt);
         break;
     }
 }
+
+/* ast_node_free for AST_DEREF_ASSIGN handled via default case in ast_node_free */
 
 /* ------------------------------------------------------------
  *  Function codegen
@@ -3046,6 +5177,14 @@ void codegen_function(CodeGen *cg, ASTNode *func) {
                      cg->sret_offset, arg_reg(cg, 0));
     }
 
+    if (!cg->target_aarch64) {
+        int reg_count = func->data.function.param_count + (cg->has_sret ? 1 : 0);
+        int reg_max = cg->target_windows ? 4 : 6;
+        if (reg_count > reg_max) reg_count = reg_max;
+        for (int i = 0; i < reg_count; i++)
+            codegen_emit(cg,"    mov %s, %s", arg_saved_reg(cg, i), arg_reg(cg, i));
+    }
+
     for (int i = 0; i < func->data.function.param_count; i++) {
         ValueType pt = func->data.function.param_types[i];
         TypeInfo *pti = func->data.function.param_typeinfo
@@ -3061,17 +5200,23 @@ void codegen_function(CodeGen *cg, ASTNode *func) {
                 pti = typeinfo_clone(pti);
             }
             pti->is_ref = true;
-        } else if (pti && (pti->kind==TYPE_TUPLE || pti->kind==TYPE_STRUCT)) {
-            pti = typeinfo_ref(pti);
         }
         int reg_idx = i + (cg->has_sret ? 1 : 0);
         if (reg_idx >= ARG_REGS_MAX)
-            error_at(func->line, func->column,
+            error_at(ERR_TYPE, func->line, func->column,
                      "function '%s' has too many parameters (max %d)",
                      func->data.function.name, ARG_REGS_MAX);
         codegen_add_var(cg, func->data.function.param_names[i], pt, true, pti);
-        codegen_emit(cg,"    mov [rbp - %d], %s",
-                     cg->stack_offset, arg_reg(cg, reg_idx));
+        if (!param_ref && is_copy_by_value_param(pt, pti)) {
+            int dst_off = cg->stack_offset;
+            int sz = typeinfo_size(cg, pt, pti);
+            codegen_emit(cg,"    mov rdx, %s", arg_saved_reg(cg, reg_idx));
+            codegen_emit(cg,"    lea rax, [rbp - %d]", dst_off);
+            emit_copy_bytes_x86(cg, "rax", "rdx", sz);
+        } else {
+            codegen_emit(cg,"    mov [rbp - %d], %s",
+                         cg->stack_offset, arg_saved_reg(cg, reg_idx));
+        }
     }
 
     for (int i = 0; i < func->data.function.body_count; i++)
@@ -3148,7 +5293,7 @@ static void codegen_emit_module(CodeGen *cg, const char *module_name,
                      fn->data.function.param_count);
     }
 
-    strncpy(cg->current_module, module_name, MAX_TOKEN_LEN-1);
+    vl_strncpy(cg->current_module, module_name, MAX_TOKEN_LEN);
     codegen_emit(cg,"; ===== module: %s =====", module_name);
 
     for (int i = 0; i < prog->data.program.function_count; i++) {
@@ -3173,12 +5318,39 @@ static void codegen_emit_module(CodeGen *cg, const char *module_name,
             cg->stack_offset += 8; cg->sret_offset = cg->stack_offset;
             codegen_emit(cg,"    mov [rbp - %d], %s", cg->sret_offset, arg_reg(cg,0));
         }
+        {
+            int reg_count = fn->data.function.param_count + (cg->has_sret ? 1 : 0);
+            int reg_max = cg->target_windows ? 4 : 6;
+            if (reg_count > reg_max) reg_count = reg_max;
+            for (int i = 0; i < reg_count; i++)
+                codegen_emit(cg,"    mov %s, %s", arg_saved_reg(cg, i), arg_reg(cg, i));
+        }
         for (int j = 0; j < fn->data.function.param_count; j++) {
             int reg_idx = j + (cg->has_sret?1:0);
-            codegen_add_var(cg, fn->data.function.param_names[j],
-                            fn->data.function.param_types[j], true,
-                            fn->data.function.param_typeinfo ? fn->data.function.param_typeinfo[j] : NULL);
-            codegen_emit(cg,"    mov [rbp - %d], %s", cg->stack_offset, arg_reg(cg,reg_idx));
+            ValueType pt = fn->data.function.param_types[j];
+            TypeInfo *pti = fn->data.function.param_typeinfo
+                            ? fn->data.function.param_typeinfo[j] : NULL;
+            bool param_ref = fn->data.function.param_is_ref
+                             && fn->data.function.param_is_ref[j];
+            if (param_ref) {
+                if (!pti) {
+                    pti = (TypeInfo*)calloc(1, sizeof(TypeInfo));
+                    pti->kind = pt;
+                } else {
+                    pti = typeinfo_clone(pti);
+                }
+                pti->is_ref = true;
+            }
+            codegen_add_var(cg, fn->data.function.param_names[j], pt, true, pti);
+            if (!param_ref && is_copy_by_value_param(pt, pti)) {
+                int dst_off = cg->stack_offset;
+                int sz = typeinfo_size(cg, pt, pti);
+                codegen_emit(cg,"    mov rdx, %s", arg_saved_reg(cg, reg_idx));
+                codegen_emit(cg,"    lea rax, [rbp - %d]", dst_off);
+                emit_copy_bytes_x86(cg, "rax", "rdx", sz);
+            } else {
+                codegen_emit(cg,"    mov [rbp - %d], %s", cg->stack_offset, arg_saved_reg(cg,reg_idx));
+            }
         }
         for (int j = 0; j < fn->data.function.body_count; j++)
             codegen_statement(cg, fn->data.function.body[j]);
@@ -3256,6 +5428,7 @@ static void a64_mov_imm(CodeGen *cg, const char *dst, long long val) {
 }
 
 /* load local variable at [fp-off] into x0 (or d0 for floats) */
+/*
 static void a64_load_var(CodeGen *cg, int off, ValueType t) {
     if (t == TYPE_F64 || t == TYPE_F32)
         codegen_emit(cg,"    ldr  d0, [x29, #-%d]", off);
@@ -3269,6 +5442,7 @@ static void a64_store_var(CodeGen *cg, int off, ValueType t) {
     else
         codegen_emit(cg,"    str  x0, [x29, #-%d]", off);
 }
+*/
 /* forward decl */
 static ValueType codegen_expr_a64(CodeGen *cg, ASTNode *expr);
 static void      codegen_stmt_a64(CodeGen *cg, ASTNode *stmt);
@@ -3305,15 +5479,32 @@ static ValueType codegen_expr_a64(CodeGen *cg, ASTNode *expr) {
     }
     case AST_IDENTIFIER: {
         int idx = codegen_find_var(cg, expr->data.identifier);
-        if (idx < 0) error_at(expr->line, expr->column,
+        if (idx < 0) error_at(ERR_TYPE, expr->line, expr->column,
                                "undefined variable '%s'", expr->data.identifier);
         int off = cg->var_offsets[idx];
         ValueType t = cg->var_types[idx];
         TypeInfo *ti = cg->var_typeinfo[idx];
         /* Reference param: load the pointer, then dereference */
-        if (ti && ti->is_ref) {
+        if (ti && ti->is_ref && !is_composite(t)) {
             codegen_emit(cg,"    ldr  x0, [x29, #-%d]", off);
+            if (t == TYPE_F64 || t == TYPE_F32) {
+                codegen_emit(cg,"    ldr  d0, [x0]");
+                return t;
+            }
             codegen_emit(cg,"    ldr  x0, [x0]");
+            return t;
+        }
+        if (is_composite(t)) {
+            bool by_ref = ti && (ti->by_ref || ti->is_ref);
+            bool dyn_arr = is_dyn_array_type(t, ti);
+            if (ti && ti->is_ref && dyn_arr) {
+                codegen_emit(cg,"    ldr  x0, [x29, #-%d]", off);
+                codegen_emit(cg,"    ldr  x0, [x0]");
+            } else if (by_ref || dyn_arr) {
+                codegen_emit(cg,"    ldr  x0, [x29, #-%d]", off);
+            } else {
+                codegen_emit(cg,"    sub  x0, x29, #%d", off);
+            }
             return t;
         }
         if (t == TYPE_F64 || t == TYPE_F32) {
@@ -3324,6 +5515,38 @@ static ValueType codegen_expr_a64(CodeGen *cg, ASTNode *expr) {
         return t;
     }
     case AST_BINARY_OP: {
+        /* ?? null coalescing — short-circuit for AArch64 */
+        if (expr->data.binary.op == OP_COALESCE) {
+            int notnull_lbl = codegen_new_label(cg);
+            int done_lbl    = codegen_new_label(cg);
+            ValueType lt = codegen_expr_a64(cg, expr->data.binary.left);
+            if (lt == TYPE_OPT_F64) codegen_emit(cg,"    fmov x10, d0");
+            else if (lt == TYPE_OPT_F32) codegen_emit(cg,"    fmov w10, s0");
+            else codegen_emit(cg,"    mov  x10, x0");
+            switch (lt) {
+            case TYPE_OPT_INT:
+                codegen_emit(cg,"    mov  x9, #0x8000");
+                codegen_emit(cg,"    movk x9, #0, lsl #16");
+                codegen_emit(cg,"    movk x9, #0, lsl #32");
+                codegen_emit(cg,"    movk x9, #0x8000, lsl #48");
+                codegen_emit(cg,"    cmp  x10, x9");
+                codegen_emit(cg,"    b.ne .VL%d", notnull_lbl); break;
+            case TYPE_OPT_BOOL:
+                codegen_emit(cg,"    cmp  x10, #2");
+                codegen_emit(cg,"    b.ne .VL%d", notnull_lbl); break;
+            default:
+                codegen_emit(cg,"    cbnz x10, .VL%d", notnull_lbl); break;
+            }
+            ValueType rt = codegen_expr_a64(cg, expr->data.binary.right);
+            codegen_emit(cg,"    b    .VL%d", done_lbl);
+            codegen_emit(cg,".VL%d:", notnull_lbl);
+            codegen_emit(cg,"    mov  x0, x10");
+            if (lt == TYPE_OPT_F64) codegen_emit(cg,"    fmov d0, x10");
+            if (lt == TYPE_OPT_F32) codegen_emit(cg,"    fmov s0, w10");
+            codegen_emit(cg,".VL%d:", done_lbl);
+            return rt;
+        }
+
         ValueType lt = codegen_expr_a64(cg, expr->data.binary.left);
         bool is_float_op = (lt == TYPE_F64 || lt == TYPE_F32);
 
@@ -3361,9 +5584,13 @@ static ValueType codegen_expr_a64(CodeGen *cg, ASTNode *expr) {
             case OP_NE:  codegen_emit(cg,"    fcmp d0, d1");
                          codegen_emit(cg,"    cset x0, ne"); return TYPE_INT;
             case OP_LT:  codegen_emit(cg,"    fcmp d0, d1");
-                         codegen_emit(cg,"    cset x0, mi"); return TYPE_INT;
+                         codegen_emit(cg,"    cset x0, mi");
+                         codegen_emit(cg,"    cset x1, vc");
+                         codegen_emit(cg,"    and  x0, x0, x1"); return TYPE_INT;
             case OP_LE:  codegen_emit(cg,"    fcmp d0, d1");
-                         codegen_emit(cg,"    cset x0, ls"); return TYPE_INT;
+                         codegen_emit(cg,"    cset x0, ls");
+                         codegen_emit(cg,"    cset x1, vc");
+                         codegen_emit(cg,"    and  x0, x0, x1"); return TYPE_INT;
             case OP_GT:  codegen_emit(cg,"    fcmp d0, d1");
                          codegen_emit(cg,"    cset x0, gt"); return TYPE_INT;
             case OP_GE:  codegen_emit(cg,"    fcmp d0, d1");
@@ -3408,6 +5635,27 @@ static ValueType codegen_expr_a64(CodeGen *cg, ASTNode *expr) {
         return TYPE_INT;
     }
     case AST_UNARY_OP: {
+        if (expr->data.unary.op == UOP_ADDR) {
+            emit_lvalue_addr_a64(cg, expr->data.unary.operand);
+            return TYPE_PTR;
+        }
+        if (expr->data.unary.op == UOP_DEREF) {
+            ASTNode *op = expr->data.unary.operand;
+            bool ref_op = false;
+            if (op->type == AST_IDENTIFIER) {
+                int _idx = codegen_find_var(cg, op->data.identifier);
+                if (_idx >= 0) {
+                    TypeInfo *_ti = cg->var_typeinfo[_idx];
+                    if (_ti && _ti->is_ref) {
+                        codegen_emit(cg,"    ldr  x0, [x29, #-%d]", cg->var_offsets[_idx]);
+                        ref_op = true;
+                    }
+                }
+            }
+            if (!ref_op) codegen_expr_a64(cg, op);
+            codegen_emit(cg,"    ldr  x0, [x0]");
+            return TYPE_INT;
+        }
         codegen_expr_a64(cg, expr->data.unary.operand);
         if (expr->data.unary.op == UOP_NOT)
             codegen_emit(cg,"    eor  x0, x0, #1");
@@ -3648,6 +5896,20 @@ static ValueType codegen_expr_a64(CodeGen *cg, ASTNode *expr) {
             (void)ret_ti;
             return TYPE_ARRAY;
         }
+        /* Selective import: anaw mod::func; → allow unqualified call (a64) */
+        char sel_mangled_a64[MAX_TOKEN_LEN * 2 + 4];
+        if (!func_sig_find(cg, call_name)) {
+            for (int _si = 0; _si < cg->sel_import_count; _si++) {
+                if (strcmp(cg->sel_import_funcs[_si], call_name) == 0) {
+                    snprintf(sel_mangled_a64, sizeof(sel_mangled_a64), "%s__%s",
+                             cg->sel_import_modules[_si], call_name);
+                    if (func_sig_find(cg, sel_mangled_a64)) {
+                        call_name = sel_mangled_a64; break;
+                    }
+                }
+            }
+        }
+
         /* ---- Generic function call ---- */
         FunctionSig *sig = func_sig_find(cg, call_name);
         /* If compiling as a module, prefix internal function calls.
@@ -3680,13 +5942,30 @@ static ValueType codegen_expr_a64(CodeGen *cg, ASTNode *expr) {
             }
             (void)is_other_module;
         }
+        {
+            ASTNode *generic_tmpl = find_generic_template(call_name);
+            if (generic_tmpl) {
+                char generic_name[MAX_TOKEN_LEN * 3];
+                if (!queue_generic_instantiation(cg, generic_tmpl,
+                                                 expr->data.call.args, argc,
+                                                 generic_name, sizeof(generic_name))) {
+                    error_at(ERR_TYPE, expr->line, expr->column,
+                             "could not instantiate generic function '%s'", call_name);
+                }
+                call_name = generic_name;
+                sig = func_sig_find(cg, call_name);
+            }
+        }
         for (int i = argc-1; i >= 0; i--) {
             bool is_ref = sig && sig->param_is_ref && i < sig->param_count
                           && sig->param_is_ref[i];
-            if (is_ref && expr->data.call.args[i]->type == AST_IDENTIFIER) {
-                int vi = codegen_find_var(cg, expr->data.call.args[i]->data.identifier);
-                if (vi >= 0)
-                    codegen_emit(cg,"    sub  x0, x29, #%d", cg->var_offsets[vi]);
+            if (is_ref) {
+                ValueType arg_t = infer_expr_type(cg, expr->data.call.args[i]);
+                if (arg_t == TYPE_PTR) {
+                    codegen_expr_a64(cg, expr->data.call.args[i]);
+                } else {
+                    emit_lvalue_addr_a64(cg, expr->data.call.args[i]);
+                }
             } else {
                 ValueType at = codegen_expr_a64(cg, expr->data.call.args[i]);
                 /* floats land in d0 — move bits to x0 for integer push */
@@ -3702,14 +5981,155 @@ static ValueType codegen_expr_a64(CodeGen *cg, ASTNode *expr) {
                 (sig->param_types[i]==TYPE_F64||sig->param_types[i]==TYPE_F32))
                 codegen_emit(cg,"    fmov d%d, x%d", i, i);
         }
-        codegen_emit(cg,"    bl   %s", call_name);
+        /* Indirect call if call_name is a function pointer variable (AArch64) */
+        {
+            int _fp = codegen_find_var(cg, expr->data.call.func_name);
+            bool _is_fp = _fp >= 0 &&
+                          (cg->var_types[_fp] == TYPE_FUNCPTR ||
+                           cg->var_types[_fp] == TYPE_PTR);
+            if (_is_fp) {
+                codegen_emit(cg,"    ldr  x8, [x29, #-%d]", cg->var_offsets[_fp]);
+                codegen_emit(cg,"    blr  x8");
+            } else {
+                codegen_emit(cg,"    bl   %s", call_name);
+            }
+        }
         return sig ? sig->return_type : TYPE_INT;
     }
     case AST_MODULE_CALL: {
         /* Map io.chhaap / io.chhaapLine etc. → Bionic libc printf/write */
         const char *mn = expr->data.module_call.module_name;
         const char *fn = expr->data.module_call.func_name;
+        if (strcmp(mn, "io") == 0 && strcmp(fn, "chhaapln") == 0)
+            fn = "chhaapLine";
         int argc = expr->data.module_call.arg_count;
+
+        /* ---- amal method dispatch (a64): p.method(args) → StructName__method(&p, args) ---- */
+        {
+            int vi = codegen_find_var(cg, mn);
+            if (vi >= 0 && cg->var_types[vi] == TYPE_STRUCT) {
+                TypeInfo *vti = cg->var_typeinfo[vi];
+                if (vti && vti->struct_name[0] && method_find(cg, vti->struct_name, fn)) {
+                    char mangled[MAX_TOKEN_LEN*2+4];
+                    snprintf(mangled, sizeof(mangled), "%s__%s", vti->struct_name, fn);
+                    /* push explicit args in reverse */
+                    for (int i = argc - 1; i >= 0; i--) {
+                        ValueType at = codegen_expr_a64(cg, expr->data.module_call.args[i]);
+                        if (at == TYPE_F64 || at == TYPE_F32)
+                            codegen_emit(cg,"    fmov x0, d0");
+                        codegen_emit(cg,"    str  x0, [sp, #-16]!");
+                    }
+                    /* push &self */
+                    codegen_emit(cg,"    add  x0, x29, #-%d", cg->var_offsets[vi]);
+                    codegen_emit(cg,"    str  x0, [sp, #-16]!");
+                    /* pop into x0..xN: x0=&self, x1=args[0], ... */
+                    int total = 1 + argc;
+                    for (int i = 0; i < total && i < 8; i++)
+                        codegen_emit(cg,"    ldr  x%d, [sp], #16", i);
+                    codegen_emit(cg,"    bl   %s", mangled);
+                    return TYPE_INT;
+                }
+            }
+        }
+
+        /* Optional methods: val.unwrap_or(default) / val.is_some() / val.is_none() */
+        {
+            int vi = codegen_find_var(cg, mn);
+            if (vi >= 0 && is_optional(cg->var_types[vi])) {
+                ValueType ot = cg->var_types[vi];
+                /* Load opt variable into x10, compare with null sentinel */
+                #define A64_OPT_LOAD_CMP(bne_or_cbnz, lbl) do { \
+                    codegen_emit(cg,"    ldr  x10, [x29, #-%d]", cg->var_offsets[vi]); \
+                    switch (ot) { \
+                    case TYPE_OPT_INT: \
+                        codegen_emit(cg,"    mov  x9, #0x8000"); \
+                        codegen_emit(cg,"    movk x9, #0, lsl #16"); \
+                        codegen_emit(cg,"    movk x9, #0, lsl #32"); \
+                        codegen_emit(cg,"    movk x9, #0x8000, lsl #48"); \
+                        codegen_emit(cg,"    cmp  x10, x9"); \
+                        codegen_emit(cg,"    " bne_or_cbnz " .VL%d", lbl); break; \
+                    case TYPE_OPT_BOOL: \
+                        codegen_emit(cg,"    cmp  x10, #2"); \
+                        codegen_emit(cg,"    " bne_or_cbnz " .VL%d", lbl); break; \
+                    default: \
+                        codegen_emit(cg,"    cbnz x10, .VL%d", lbl); break; \
+                    } \
+                } while(0)
+
+                if (strcmp(fn,"is_some")==0 && argc==0) {
+                    int lbl = codegen_new_label(cg), done = codegen_new_label(cg);
+                    A64_OPT_LOAD_CMP("b.ne", lbl);
+                    codegen_emit(cg,"    mov  x0, #0");
+                    codegen_emit(cg,"    b    .VL%d", done);
+                    codegen_emit(cg,".VL%d:", lbl);
+                    codegen_emit(cg,"    mov  x0, #1");
+                    codegen_emit(cg,".VL%d:", done);
+                    #undef A64_OPT_LOAD_CMP
+                    return TYPE_BOOL;
+                }
+                #undef A64_OPT_LOAD_CMP
+                #define A64_OPT_LOAD_CMP(bne_or_cbnz, lbl) do { \
+                    codegen_emit(cg,"    ldr  x10, [x29, #-%d]", cg->var_offsets[vi]); \
+                    switch (ot) { \
+                    case TYPE_OPT_INT: \
+                        codegen_emit(cg,"    mov  x9, #0x8000"); \
+                        codegen_emit(cg,"    movk x9, #0, lsl #16"); \
+                        codegen_emit(cg,"    movk x9, #0, lsl #32"); \
+                        codegen_emit(cg,"    movk x9, #0x8000, lsl #48"); \
+                        codegen_emit(cg,"    cmp  x10, x9"); \
+                        codegen_emit(cg,"    " bne_or_cbnz " .VL%d", lbl); break; \
+                    case TYPE_OPT_BOOL: \
+                        codegen_emit(cg,"    cmp  x10, #2"); \
+                        codegen_emit(cg,"    " bne_or_cbnz " .VL%d", lbl); break; \
+                    default: \
+                        codegen_emit(cg,"    cbnz x10, .VL%d", lbl); break; \
+                    } \
+                } while(0)
+                if (strcmp(fn,"is_none")==0 && argc==0) {
+                    int lbl = codegen_new_label(cg), done = codegen_new_label(cg);
+                    A64_OPT_LOAD_CMP("b.ne", lbl);
+                    codegen_emit(cg,"    mov  x0, #1");
+                    codegen_emit(cg,"    b    .VL%d", done);
+                    codegen_emit(cg,".VL%d:", lbl);
+                    codegen_emit(cg,"    mov  x0, #0");
+                    codegen_emit(cg,".VL%d:", done);
+                    #undef A64_OPT_LOAD_CMP
+                    return TYPE_BOOL;
+                }
+                #undef A64_OPT_LOAD_CMP
+                #define A64_OPT_LOAD_CMP(bne_or_cbnz, lbl) do { \
+                    codegen_emit(cg,"    ldr  x10, [x29, #-%d]", cg->var_offsets[vi]); \
+                    switch (ot) { \
+                    case TYPE_OPT_INT: \
+                        codegen_emit(cg,"    mov  x9, #0x8000"); \
+                        codegen_emit(cg,"    movk x9, #0, lsl #16"); \
+                        codegen_emit(cg,"    movk x9, #0, lsl #32"); \
+                        codegen_emit(cg,"    movk x9, #0x8000, lsl #48"); \
+                        codegen_emit(cg,"    cmp  x10, x9"); \
+                        codegen_emit(cg,"    " bne_or_cbnz " .VL%d", lbl); break; \
+                    case TYPE_OPT_BOOL: \
+                        codegen_emit(cg,"    cmp  x10, #2"); \
+                        codegen_emit(cg,"    " bne_or_cbnz " .VL%d", lbl); break; \
+                    default: \
+                        codegen_emit(cg,"    cbnz x10, .VL%d", lbl); break; \
+                    } \
+                } while(0)
+                if (strcmp(fn,"unwrap_or")==0 && argc==1) {
+                    int notnull = codegen_new_label(cg), done = codegen_new_label(cg);
+                    A64_OPT_LOAD_CMP("b.ne", notnull);
+                    ValueType rt = codegen_expr_a64(cg, expr->data.module_call.args[0]);
+                    codegen_emit(cg,"    b    .VL%d", done);
+                    codegen_emit(cg,".VL%d:", notnull);
+                    codegen_emit(cg,"    ldr  x0, [x29, #-%d]", cg->var_offsets[vi]);
+                    if (ot==TYPE_OPT_F64) { codegen_emit(cg,"    fmov d0, x0"); rt=TYPE_F64; }
+                    else if (ot==TYPE_OPT_F32) { codegen_emit(cg,"    fmov s0, w0"); rt=TYPE_F32; }
+                    codegen_emit(cg,".VL%d:", done);
+                    #undef A64_OPT_LOAD_CMP
+                    return rt;
+                }
+                #undef A64_OPT_LOAD_CMP
+            }
+        }
 
         /* Route any non-io module to its symbol: module__func */
         if (strcmp(mn,"io") != 0) {
@@ -3727,8 +6147,13 @@ static ValueType codegen_expr_a64(CodeGen *cg, ASTNode *expr) {
         }
 
         if (strcmp(mn,"io")==0) {
-            if (strcmp(fn,"chhaap")==0 || strcmp(fn,"chhaapLine")==0) {
-                bool newline = (strcmp(fn,"chhaapLine")==0);
+            bool is_newline_print =
+                (strcmp(fn,"chhaapLine")==0 ||
+                 strcmp(fn,"chhaapln")==0 ||
+                 strcmp(fn,"print")==0 ||
+                 strcmp(fn,"println")==0);
+            if (strcmp(fn,"chhaap")==0 || is_newline_print) {
+                bool newline = is_newline_print;
                 if (argc == 0) {
                     /* bare chhaapLine() → newline only */
                     int sid = codegen_intern_string(cg, "\n");
@@ -3747,14 +6172,16 @@ static ValueType codegen_expr_a64(CodeGen *cg, ASTNode *expr) {
                     /* single value — auto-format */
                     ASTNode *arg = expr->data.module_call.args[0];
                     ValueType at = codegen_expr_a64(cg, arg);
+                    TypeInfo *ati = expr_typeinfo(cg, arg);
                     if (at==TYPE_F64||at==TYPE_F32)
                         codegen_emit(cg,"    fmov x1, d0");
                     else
                         codegen_emit(cg,"    mov  x1, x0");
                     const char *fmt = "%lld";
-                    if (at==TYPE_STRING) fmt="%s";
+                    if (at==TYPE_STRING || is_byte_buffer(at, ati)) fmt="%s";
                     else if (at==TYPE_BOOL) fmt="%d";
                     else if (at==TYPE_F64||at==TYPE_F32) fmt="%f";
+                    else if (at==TYPE_PTR||at==TYPE_FUNCPTR) fmt="%lx";
                     char fmtbuf[32];
                     if (newline) { snprintf(fmtbuf,sizeof(fmtbuf),"%s\n",fmt); fmt=fmtbuf; }
                     int sid = codegen_intern_string(cg, fmt);
@@ -3795,6 +6222,12 @@ static ValueType codegen_expr_a64(CodeGen *cg, ASTNode *expr) {
             {
                 char sym[MAX_TOKEN_LEN*2+4];
                 snprintf(sym, sizeof(sym), "io__%s", fn);
+                if (strcmp(fn,"read")==0 || strcmp(fn,"write")==0) {
+                    if (argc != 3)
+                        error_at(ERR_TYPE, expr->line, expr->column, "io.%s expects 3 arguments", fn);
+                    validate_io_buffer_arg(cg, expr->data.module_call.args[1],
+                                           expr->line, expr->column, fn);
+                }
                 for (int i = argc-1; i >= 0; i--) {
                     ValueType at = codegen_expr_a64(cg, expr->data.module_call.args[i]);
                     if (at==TYPE_F64||at==TYPE_F32)
@@ -4014,7 +6447,7 @@ static void codegen_stmt_a64(CodeGen *cg, ASTNode *stmt) {
             if (val->type == AST_STRUCT_LITERAL) {
                 ti = (TypeInfo*)calloc(1, sizeof(TypeInfo));
                 ti->kind = TYPE_STRUCT;
-                strncpy(ti->struct_name, val->data.struct_lit.struct_name, MAX_TOKEN_LEN-1);
+                vl_strncpy(ti->struct_name, val->data.struct_lit.struct_name, MAX_TOKEN_LEN);
                 decl = TYPE_STRUCT;
             } else if (val->type == AST_ARRAY_LITERAL) {
                 ti = (TypeInfo*)calloc(1, sizeof(TypeInfo));
@@ -4041,6 +6474,28 @@ static void codegen_stmt_a64(CodeGen *cg, ASTNode *stmt) {
     }
 
     /* ---- assignment ---- */
+    case AST_DEREF_ASSIGN: {
+        /* *ptr = val (AArch64) — handle ref params without double-deref */
+        ASTNode *ptr_expr2 = stmt->data.deref_assign.ptr_expr;
+        bool ptr_is_ref2 = false;
+        if (ptr_expr2->type == AST_IDENTIFIER) {
+            int _idx = codegen_find_var(cg, ptr_expr2->data.identifier);
+            if (_idx >= 0) {
+                TypeInfo *_ti = cg->var_typeinfo[_idx];
+                if (_ti && _ti->is_ref) {
+                    codegen_emit(cg,"    ldr  x0, [x29, #-%d]", cg->var_offsets[_idx]);
+                    ptr_is_ref2 = true;
+                }
+            }
+        }
+        if (!ptr_is_ref2) codegen_expr_a64(cg, ptr_expr2);
+        codegen_emit(cg,"    str  x0, [sp, #-16]!");  /* save ptr */
+        codegen_expr_a64(cg, stmt->data.deref_assign.value);
+        codegen_emit(cg,"    ldr  x1, [sp], #16");    /* x1 = ptr */
+        codegen_emit(cg,"    str  x0, [x1]");         /* *ptr = val */
+        break;
+    }
+
     case AST_ASSIGN: {
         /* discard: _ = expr */
         if (strcmp(stmt->data.assign.var_name, "_discard") == 0) {
@@ -4048,22 +6503,35 @@ static void codegen_stmt_a64(CodeGen *cg, ASTNode *stmt) {
             break;
         }
         int idx = codegen_find_var(cg, stmt->data.assign.var_name);
-        if (idx < 0) error_at(stmt->line, stmt->column,
+        if (idx < 0) error_at(ERR_TYPE, stmt->line, stmt->column,
                                "undefined variable '%s'", stmt->data.assign.var_name);
         ValueType decl = cg->var_types[idx];
         TypeInfo *ti = cg->var_typeinfo[idx];
         bool is_ref_v = ti && ti->is_ref;
         if (!cg->var_mutable[idx] && !is_ref_v)
-            error_at(stmt->line, stmt->column,
+            error_at(ERR_TYPE, stmt->line, stmt->column,
                      "cannot assign to immutable '%s'", stmt->data.assign.var_name);
         ValueType vt = codegen_expr_a64(cg, stmt->data.assign.value);
         int off = cg->var_offsets[idx];
-        if (is_ref_v) {
+        if (is_ref_v && !is_composite(decl)) {
             codegen_emit(cg,"    ldr  x1, [x29, #-%d]", off);
             if (decl==TYPE_F64||decl==TYPE_F32)
                 codegen_emit(cg,"    str  d0, [x1]");
             else
                 codegen_emit(cg,"    str  x0, [x1]");
+        } else if (is_ref_v && decl == TYPE_ARRAY && ti && ti->array_len < 0) {
+            codegen_emit(cg,"    ldr  x1, [x29, #-%d]", off);
+            codegen_emit(cg,"    str  x0, [x1]");
+        } else if (is_ref_v && is_composite(decl)) {
+            int sz = typeinfo_size(cg, decl, ti);
+            codegen_emit(cg,"    ldr  x1, [x29, #-%d]", off);
+            codegen_emit(cg,"    mov  x2, x0");
+            emit_copy_bytes_a64(cg, "x1", "x2", sz);
+        } else if (is_copy_by_value_param(decl, ti)) {
+            int sz = typeinfo_size(cg, decl, ti);
+            codegen_emit(cg,"    sub  x1, x29, #%d", off);
+            codegen_emit(cg,"    mov  x2, x0");
+            emit_copy_bytes_a64(cg, "x1", "x2", sz);
         } else if (decl==TYPE_F64||decl==TYPE_F32) {
             if (vt!=TYPE_F64&&vt!=TYPE_F32) codegen_emit(cg,"    scvtf d0, x0");
             codegen_emit(cg,"    str  d0, [x29, #-%d]", off);
@@ -4077,13 +6545,13 @@ static void codegen_stmt_a64(CodeGen *cg, ASTNode *stmt) {
     /* ---- compound assign +=, -=, *=, /=, %=, &=, |=, ^=, <<=, >>= ---- */
     case AST_COMPOUND_ASSIGN: {
         int idx = codegen_find_var(cg, stmt->data.compound_assign.var_name);
-        if (idx < 0) error_at(stmt->line, stmt->column,
+        if (idx < 0) error_at(ERR_TYPE, stmt->line, stmt->column,
                                "undefined variable '%s'",
                                stmt->data.compound_assign.var_name);
         TypeInfo *ti = cg->var_typeinfo[idx];
         bool is_ref_v = ti && ti->is_ref;
         if (!cg->var_mutable[idx] && !is_ref_v)
-            error_at(stmt->line, stmt->column,
+            error_at(ERR_TYPE, stmt->line, stmt->column,
                      "cannot assign to immutable '%s'",
                      stmt->data.compound_assign.var_name);
         ValueType decl = cg->var_types[idx];
@@ -4178,13 +6646,19 @@ static void codegen_stmt_a64(CodeGen *cg, ASTNode *stmt) {
         int lend  = codegen_new_label(cg);
         codegen_expr_a64(cg, stmt->data.if_stmt.condition);
         codegen_emit(cg,"    cbz  x0, .L%d", lelse);
-        for (int i=0;i<stmt->data.if_stmt.then_count;i++)
-            codegen_stmt_a64(cg, stmt->data.if_stmt.then_stmts[i]);
+        { int sv = cg->var_count;
+          for (int i=0;i<stmt->data.if_stmt.then_count;i++)
+              codegen_stmt_a64(cg, stmt->data.if_stmt.then_stmts[i]);
+          for (int _i=sv;_i<cg->var_count;_i++){free(cg->local_vars[_i]);cg->local_vars[_i]=NULL;}
+          cg->var_count = sv; }
         if (stmt->data.if_stmt.else_count > 0)
             codegen_emit(cg,"    b    .L%d", lend);
         codegen_emit(cg,".L%d:", lelse);
-        for (int i=0;i<stmt->data.if_stmt.else_count;i++)
-            codegen_stmt_a64(cg, stmt->data.if_stmt.else_stmts[i]);
+        { int sv = cg->var_count;
+          for (int i=0;i<stmt->data.if_stmt.else_count;i++)
+              codegen_stmt_a64(cg, stmt->data.if_stmt.else_stmts[i]);
+          for (int _i=sv;_i<cg->var_count;_i++){free(cg->local_vars[_i]);cg->local_vars[_i]=NULL;}
+          cg->var_count = sv; }
         if (stmt->data.if_stmt.else_count > 0)
             codegen_emit(cg,".L%d:", lend);
         break;
@@ -4202,11 +6676,24 @@ static void codegen_stmt_a64(CodeGen *cg, ASTNode *stmt) {
         codegen_emit(cg,".L%d:", lstart);
         codegen_expr_a64(cg, stmt->data.while_stmt.condition);
         codegen_emit(cg,"    cbz  x0, .L%d", lend);
-        for (int i=0;i<stmt->data.while_stmt.body_count;i++)
-            codegen_stmt_a64(cg, stmt->data.while_stmt.body[i]);
+        { int sv = cg->var_count;
+          for (int i=0;i<stmt->data.while_stmt.body_count;i++)
+              codegen_stmt_a64(cg, stmt->data.while_stmt.body[i]);
+          for (int _i=sv;_i<cg->var_count;_i++){free(cg->local_vars[_i]);cg->local_vars[_i]=NULL;}
+          cg->var_count = sv; }
         codegen_emit(cg,"    b    .L%d", lstart);
         codegen_emit(cg,".L%d:", lend);
         if (cg->loop_depth > 0) cg->loop_depth--;
+        break;
+    }
+
+    /* ---- bare scoped block ---- */
+    case AST_BLOCK: {
+        int sv = cg->var_count;
+        for (int i=0;i<stmt->data.block_stmt.count;i++)
+            codegen_stmt_a64(cg, stmt->data.block_stmt.stmts[i]);
+        for (int _i=sv;_i<cg->var_count;_i++){free(cg->local_vars[_i]);cg->local_vars[_i]=NULL;}
+        cg->var_count = sv;
         break;
     }
 
@@ -4340,6 +6827,7 @@ static void codegen_stmt_a64(CodeGen *cg, ASTNode *stmt) {
         int lstart = codegen_new_label(cg);
         int lcont  = codegen_new_label(cg);
         int lend   = codegen_new_label(cg);
+        int saved_for = cg->var_count;
         if (stmt->data.for_stmt.init)
             codegen_stmt_a64(cg, stmt->data.for_stmt.init);
         if (cg->loop_depth < MAX_LOOP_DEPTH) {
@@ -4352,14 +6840,19 @@ static void codegen_stmt_a64(CodeGen *cg, ASTNode *stmt) {
             codegen_expr_a64(cg, stmt->data.for_stmt.condition);
             codegen_emit(cg,"    cbz  x0, .L%d", lend);
         }
-        for (int i=0;i<stmt->data.for_stmt.body_count;i++)
-            codegen_stmt_a64(cg, stmt->data.for_stmt.body[i]);
+        { int sv = cg->var_count;
+          for (int i=0;i<stmt->data.for_stmt.body_count;i++)
+              codegen_stmt_a64(cg, stmt->data.for_stmt.body[i]);
+          for (int _i=sv;_i<cg->var_count;_i++){free(cg->local_vars[_i]);cg->local_vars[_i]=NULL;}
+          cg->var_count = sv; }
         codegen_emit(cg,".L%d:", lcont);
         if (stmt->data.for_stmt.post)
             codegen_stmt_a64(cg, stmt->data.for_stmt.post);
         codegen_emit(cg,"    b    .L%d", lstart);
         codegen_emit(cg,".L%d:", lend);
         if (cg->loop_depth > 0) cg->loop_depth--;
+        for (int _i=saved_for;_i<cg->var_count;_i++){free(cg->local_vars[_i]);cg->local_vars[_i]=NULL;}
+        cg->var_count = saved_for;
         break;
     }
 
@@ -4379,12 +6872,18 @@ static void codegen_stmt_a64(CodeGen *cg, ASTNode *stmt) {
         codegen_expr_a64(cg, stmt->data.array_assign.index);
         codegen_emit(cg,"    str  x0, [sp, #-16]!");   /* save index */
         int aidx = codegen_find_var(cg, stmt->data.array_assign.var_name);
-        if (aidx < 0) error_at(stmt->line, stmt->column,
+        if (aidx < 0) error_at(ERR_TYPE, stmt->line, stmt->column,
                                "undefined array '%s'", stmt->data.array_assign.var_name);
         TypeInfo *ati = cg->var_typeinfo[aidx];
         bool dyn = ati && (ati->array_len < 0 || ati->is_dynamic);
-        codegen_emit(cg,"    ldr  x9, [x29, #-%d]", cg->var_offsets[aidx]);
-        if (dyn) codegen_emit(cg,"    ldr  x9, [x9]"); /* dyn arr: stored ptr */
+        if (ati && ati->is_ref) {
+            codegen_emit(cg,"    ldr  x9, [x29, #-%d]", cg->var_offsets[aidx]);
+            if (dyn) codegen_emit(cg,"    ldr  x9, [x9]");
+        } else if (dyn) {
+            codegen_emit(cg,"    ldr  x9, [x29, #-%d]", cg->var_offsets[aidx]);
+        } else {
+            codegen_emit(cg,"    sub  x9, x29, #%d", cg->var_offsets[aidx]);
+        }
         codegen_emit(cg,"    ldr  x1, [sp], #16");     /* index */
         codegen_emit(cg,"    ldr  x0, [sp], #16");     /* value */
         codegen_emit(cg,"    str  x0, [x9, x1, lsl #3]");
@@ -4393,10 +6892,27 @@ static void codegen_stmt_a64(CodeGen *cg, ASTNode *stmt) {
 
     /* ---- field assign: s.field = val ---- */
     case AST_FIELD_ASSIGN: {
+        if (stmt->data.field_assign.target) {
+            ValueType expect = infer_expr_type(cg, stmt->data.field_assign.target);
+            emit_lvalue_addr_a64(cg, stmt->data.field_assign.target);
+            codegen_emit(cg,"    str  x0, [sp, #-16]!");
+            ValueType vt = codegen_expr_a64(cg, stmt->data.field_assign.value);
+            validate_unsigned_literal_range(stmt->data.field_assign.value, expect,
+                                            stmt->line, stmt->column);
+            if (vt != expect) vt = a64_cast_basic(cg, vt, expect);
+            codegen_emit(cg,"    ldr  x9, [sp], #16");
+            if (expect == TYPE_F32)
+                codegen_emit(cg,"    str  s0, [x9]");
+            else if (expect == TYPE_F64)
+                codegen_emit(cg,"    str  d0, [x9]");
+            else
+                codegen_emit(cg,"    str  x0, [x9]");
+            break;
+        }
         codegen_expr_a64(cg, stmt->data.field_assign.value);
         codegen_emit(cg,"    str  x0, [sp, #-16]!");
         int sidx = codegen_find_var(cg, stmt->data.field_assign.var_name);
-        if (sidx < 0) error_at(stmt->line, stmt->column,
+        if (sidx < 0) error_at(ERR_TYPE, stmt->line, stmt->column,
                                "undefined variable '%s'", stmt->data.field_assign.var_name);
         TypeInfo *sti = cg->var_typeinfo[sidx];
         StructDef *sd = sti ? struct_find(cg, sti->struct_name) : NULL;
@@ -4407,11 +6923,19 @@ static void codegen_stmt_a64(CodeGen *cg, ASTNode *stmt) {
                 field_off += 8;
             }
         }
-        codegen_emit(cg,"    ldr  x9, [x29, #-%d]", cg->var_offsets[sidx]);
+        if (sti && (sti->is_ref || sti->by_ref))
+            codegen_emit(cg,"    ldr  x9, [x29, #-%d]", cg->var_offsets[sidx]);
+        else
+            codegen_emit(cg,"    sub  x9, x29, #%d", cg->var_offsets[sidx]);
         codegen_emit(cg,"    ldr  x0, [sp], #16");
         codegen_emit(cg,"    str  x0, [x9, #%d]", field_off);
         break;
     }
+
+    case AST_FIELD_COMPOUND_ASSIGN:
+        error_at(ERR_TYPE, stmt->line, stmt->column,
+                 "field compound assignment is not implemented for AArch64 yet");
+        break;
 
     /* ---- try/catch ---- */
     case AST_TRY_CATCH: {
@@ -4446,13 +6970,16 @@ static void codegen_stmt_a64(CodeGen *cg, ASTNode *stmt) {
         codegen_emit(cg,"    str  x0, [sp, #-16]!");   /* save elem */
         /* Get address of the array variable (pointer to the data ptr) */
         int aidx = codegen_find_var(cg, stmt->data.append_stmt.arr_name);
-        if (aidx < 0) error_at(stmt->line, stmt->column,
+        if (aidx < 0) error_at(ERR_TYPE, stmt->line, stmt->column,
                                "undefined array '%s'", stmt->data.append_stmt.arr_name);
         if (!cg->var_mutable[aidx])
-            error_at(stmt->line, stmt->column,
+            error_at(ERR_TYPE, stmt->line, stmt->column,
                      "cannot append to immutable '%s'", stmt->data.append_stmt.arr_name);
         /* x0 = address of the variable (so append can update the ptr) */
-        codegen_emit(cg,"    sub  x0, x29, #%d", cg->var_offsets[aidx]);
+        if (cg->var_typeinfo[aidx] && cg->var_typeinfo[aidx]->is_ref)
+            codegen_emit(cg,"    ldr  x0, [x29, #-%d]", cg->var_offsets[aidx]);
+        else
+            codegen_emit(cg,"    sub  x0, x29, #%d", cg->var_offsets[aidx]);
         codegen_emit(cg,"    ldr  x1, [sp], #16");     /* elem */
         codegen_emit(cg,"    bl   __vl_arr_append");
         break;
@@ -4495,12 +7022,12 @@ static void codegen_function_aarch64(CodeGen *cg, ASTNode *func) {
         char own_pfx[MAX_TOKEN_LEN + 4];
         snprintf(own_pfx, sizeof(own_pfx), "%s__", cg->module_prefix);
         if (strncmp(func->data.function.name, own_pfx, strlen(own_pfx)) == 0)
-            strncpy(emit_name, func->data.function.name, sizeof(emit_name)-1);
+            vl_strncpy(emit_name, func->data.function.name, sizeof(emit_name));
         else
             snprintf(emit_name, sizeof(emit_name), "%s__%s",
                      cg->module_prefix, func->data.function.name);
     } else
-        strncpy(emit_name, func->data.function.name, sizeof(emit_name)-1);
+        vl_strncpy(emit_name, func->data.function.name, sizeof(emit_name));
 
     codegen_emit(cg,"// ----- %s -----", emit_name);
     codegen_emit(cg,".global %s", emit_name);
@@ -4517,9 +7044,27 @@ static void codegen_function_aarch64(CodeGen *cg, ASTNode *func) {
                         ? func->data.function.param_typeinfo[i] : NULL;
         bool is_ref   = func->data.function.param_is_ref
                         && func->data.function.param_is_ref[i];
-        if (is_ref && pti) { pti = typeinfo_clone(pti); pti->is_ref = true; }
+        if (is_ref) {
+            if (!pti) {
+                pti = (TypeInfo*)calloc(1, sizeof(TypeInfo));
+                pti->kind = pt;
+            } else {
+                pti = typeinfo_clone(pti);
+            }
+            pti->is_ref = true;
+        }
         codegen_add_var(cg, func->data.function.param_names[i], pt, true, pti);
-        codegen_emit(cg,"    str  %s, [x29, #-%d]", A64_REGS[i], cg->stack_offset);
+        if (!is_ref && is_copy_by_value_param(pt, pti)) {
+            int dst_off = cg->stack_offset;
+            int sz = typeinfo_size(cg, pt, pti);
+            codegen_emit(cg,"    mov  x10, %s", A64_REGS[i]);
+            codegen_emit(cg,"    sub  x9, x29, #%d", dst_off);
+            emit_copy_bytes_a64(cg, "x9", "x10", sz);
+        } else if (pt == TYPE_F64 || pt == TYPE_F32) {
+            codegen_emit(cg,"    str  d%d, [x29, #-%d]", i, cg->stack_offset);
+        } else {
+            codegen_emit(cg,"    str  %s, [x29, #-%d]", A64_REGS[i], cg->stack_offset);
+        }
     }
 
     /* Emit body */
@@ -4534,6 +7079,15 @@ static void codegen_function_aarch64(CodeGen *cg, ASTNode *func) {
 }
 
 void codegen_program(CodeGen *cg, ASTNode *program) {
+    g_generic_template_count = 0;
+    g_generic_queue_count = 0;
+    g_generic_queue_emit_index = 0;
+    for (int i = 0; i < program->data.program.function_count && i < 256; i++) {
+        ASTNode *fn = program->data.program.functions[i];
+        if (fn->data.function.generic_count > 0)
+            g_generic_templates[g_generic_template_count++] = fn;
+    }
+
     /* ---- AArch64 path: GNU as syntax, Bionic libc ---- */
     if (cg->target_aarch64) {
         codegen_emit(cg, "    .arch armv8-a");
@@ -4550,14 +7104,19 @@ void codegen_program(CodeGen *cg, ASTNode *program) {
             func_sig_add(cg,"io__stdin",    ts,NULL,NULL,NULL,0);
             func_sig_add(cg,"io__open",     ti,NULL,p2si,NULL,2);
             func_sig_add(cg,"io__close",    ti,NULL,p1i,NULL,1);
-            ValueType p_read[3]={ti,ts,ti};
-            func_sig_add(cg,"io__read",     ti,NULL,p_read,NULL,3);
-            func_sig_add(cg,"io__write",    ti,NULL,p_read,NULL,3);
+            ValueType p_read[3]={ti,TYPE_ARRAY,ti};
+            TypeInfo *p_read_ti[3]={NULL, make_byte_buffer_typeinfo(), NULL};
+            func_sig_add(cg,"io__read",     ti,NULL,p_read,p_read_ti,3);
+            func_sig_add(cg,"io__write",    ti,NULL,p_read,p_read_ti,3);
+            typeinfo_free(p_read_ti[1]);
             (void)p1s;
         }
 
         /* Register user struct defs */
         codegen_register_structs(cg, program);
+
+        /* Register amal impl-block methods */
+        codegen_register_methods(cg, program);
 
         /* Register user function signatures (non-generic) */
         for (int i = 0; i < program->data.program.function_count; i++) {
@@ -4576,112 +7135,13 @@ void codegen_program(CodeGen *cg, ASTNode *program) {
                     sig->param_is_ref[j] = fn->data.function.param_is_ref[j];
             }
         }
-
-
-        /* ---- AArch64: monomorphize generics then emit all functions ---- */
-        {
-            /* Collect generic templates */
-            ASTNode **gtmpls = (ASTNode**)calloc(256, sizeof(ASTNode*));
-            int gnb = 0;
-            for (int i = 0; i < program->data.program.function_count; i++) {
-                ASTNode *fn = program->data.program.functions[i];
-                if (fn->data.function.generic_count > 0 && gnb < 256)
-                    gtmpls[gnb++] = fn;
-            }
-            if (gnb > 0) {
-                /* Scan call sites */
-                typedef struct { char fname[MAX_TOKEN_LEN]; ASTNode *cnode; } CSa;
-                CSa *csa = (CSa*)calloc(2048, sizeof(CSa)); int ncs = 0;
-                ASTNode **wk = (ASTNode**)malloc(65536*sizeof(ASTNode*)); int wtop=0;
-                for (int i=0;i<program->data.program.function_count;i++){
-                    ASTNode *fn=program->data.program.functions[i];
-                    if(fn->data.function.generic_count>0) continue;
-                    for(int j=0;j<fn->data.function.body_count&&wtop<65530;j++) wk[wtop++]=fn->data.function.body[j];
-                }
-                while(wtop>0){
-                    ASTNode *nd=wk[--wtop]; if(!nd||wtop>=65530) continue;
-                    if(nd->type==AST_CALL){
-                        for(int k=0;k<gnb;k++) if(strcmp(gtmpls[k]->data.function.name,nd->data.call.func_name)==0&&ncs<2048){csa[ncs].cnode=nd;strncpy(csa[ncs].fname,nd->data.call.func_name,MAX_TOKEN_LEN-1);ncs++;break;}
-                        for(int a=0;a<nd->data.call.arg_count&&wtop<65530;a++) wk[wtop++]=nd->data.call.args[a];
-                    }
-                    switch(nd->type){
-                        case AST_BINARY_OP: if(wtop<65534){wk[wtop++]=nd->data.binary.left;wk[wtop++]=nd->data.binary.right;} break;
-                        case AST_IF: if(wtop<65530){wk[wtop++]=nd->data.if_stmt.condition;for(int j=0;j<nd->data.if_stmt.then_count&&wtop<65530;j++) wk[wtop++]=nd->data.if_stmt.then_stmts[j];for(int j=0;j<nd->data.if_stmt.else_count&&wtop<65530;j++) wk[wtop++]=nd->data.if_stmt.else_stmts[j];} break;
-                        case AST_WHILE: if(wtop<65530){wk[wtop++]=nd->data.while_stmt.condition;for(int j=0;j<nd->data.while_stmt.body_count&&wtop<65530;j++) wk[wtop++]=nd->data.while_stmt.body[j];} break;
-                        case AST_LET: if(nd->data.let.value&&wtop<65535) wk[wtop++]=nd->data.let.value; break;
-                        case AST_ASSIGN: if(nd->data.assign.value&&wtop<65535) wk[wtop++]=nd->data.assign.value; break;
-                        case AST_RETURN: if(nd->data.ret.value&&wtop<65535) wk[wtop++]=nd->data.ret.value; break;
-                        /* Push module call args so nested generic calls are found */
-                        case AST_MODULE_CALL: for(int a=0;a<nd->data.module_call.arg_count&&wtop<65530;a++) wk[wtop++]=nd->data.module_call.args[a]; break;
-                        default: break;
-                    }
-                }
-                free(wk);
-                char (*inst)[MAX_TOKEN_LEN*3]=(char(*)[MAX_TOKEN_LEN*3])calloc(512,MAX_TOKEN_LEN*3); int ni=0;
-                for(int ci=0;ci<ncs;ci++){
-                    ASTNode *call=csa[ci].cnode;
-                    ASTNode *tmpl=NULL; for(int k=0;k<gnb;k++) if(strcmp(gtmpls[k]->data.function.name,call->data.call.func_name)==0){tmpl=gtmpls[k];break;}
-                    if(!tmpl) continue;
-                    int ng=tmpl->data.function.generic_count;
-                    ValueType ctypes[8]; char cnames[8][32];
-                    for(int g=0;g<ng;g++){ctypes[g]=TYPE_INT;strcpy(cnames[g],"adad");}
-                    for(int a=0;a<call->data.call.arg_count&&a<tmpl->data.function.param_count;a++){
-                        TypeInfo *pti=tmpl->data.function.param_typeinfo?tmpl->data.function.param_typeinfo[a]:NULL;
-                        if(!pti||!pti->generic_name[0]) continue;
-                        for(int g=0;g<ng;g++){
-                            if(strcmp(pti->generic_name,tmpl->data.function.generic_params[g])!=0) continue;
-                            ASTNode *arg=call->data.call.args[a];
-                            if(arg->type==AST_FLOAT){ctypes[g]=TYPE_F64;strcpy(cnames[g],"ashari");}
-                            else if(arg->type==AST_IDENTIFIER){int vi=codegen_find_var(cg,arg->data.identifier);if(vi>=0){ValueType vt=cg->var_types[vi];if(vt==TYPE_F64){ctypes[g]=TYPE_F64;strcpy(cnames[g],"ashari");}else{ctypes[g]=TYPE_INT;strcpy(cnames[g],"adad");}}}
-                            break;
-                        }
-                    }
-                    char mangled[MAX_TOKEN_LEN*3]; snprintf(mangled,sizeof(mangled),"%s",tmpl->data.function.name);
-                    for(int g=0;g<ng;g++){char pp[64];snprintf(pp,sizeof(pp),"__%s",cnames[g]);strncat(mangled,pp,sizeof(mangled)-strlen(mangled)-1);}
-                    strncpy(call->data.call.func_name,mangled,MAX_TOKEN_LEN-1);
-                    bool already=false; for(int k=0;k<ni;k++) if(strcmp(inst[k],mangled)==0){already=true;break;}
-                    if(already) continue;
-                    if(ni<512) strncpy(inst[ni++],mangled,MAX_TOKEN_LEN*3-1);
-                    int pc=tmpl->data.function.param_count;
-                    ValueType *cpt=(ValueType*)malloc(sizeof(ValueType)*pc);
-                    TypeInfo **cpti=(TypeInfo**)calloc(pc,sizeof(TypeInfo*));
-                    bool *cpref=(bool*)calloc(pc,sizeof(bool));
-                    for(int p=0;p<pc;p++){
-                        TypeInfo *op=tmpl->data.function.param_typeinfo?tmpl->data.function.param_typeinfo[p]:NULL;
-                        if(op&&op->generic_name[0]){int g2=-1;for(int g=0;g<ng;g++) if(strcmp(op->generic_name,tmpl->data.function.generic_params[g])==0){g2=g;break;} cpt[p]=(g2>=0)?ctypes[g2]:tmpl->data.function.param_types[p];}
-                        else{cpt[p]=tmpl->data.function.param_types[p];cpti[p]=typeinfo_clone(op);}
-                        if(tmpl->data.function.param_is_ref) cpref[p]=tmpl->data.function.param_is_ref[p];
-                    }
-                    ValueType cr=tmpl->data.function.return_type;
-                    TypeInfo *ori=tmpl->data.function.return_typeinfo;
-                    if(ori&&ori->generic_name[0]){int g2=-1;for(int g=0;g<ng;g++) if(strcmp(ori->generic_name,tmpl->data.function.generic_params[g])==0){g2=g;break;} cr=(g2>=0)?ctypes[g2]:cr;}
-                    func_sig_add(cg,mangled,cr,NULL,cpt,cpti,pc);
-                    FunctionSig *gs=func_sig_find(cg,mangled); if(gs) gs->param_is_ref=cpref;
-                    ASTNode *cfn=ast_node_new(AST_FUNCTION);
-                    strncpy(cfn->data.function.name,mangled,MAX_TOKEN_LEN-1);
-                    cfn->data.function.generic_count=0; cfn->data.function.is_exported=true;
-                    cfn->data.function.body=tmpl->data.function.body; cfn->data.function.body_count=tmpl->data.function.body_count;
-                    cfn->data.function.param_count=pc; cfn->data.function.param_names=tmpl->data.function.param_names;
-                    cfn->data.function.param_types=cpt; cfn->data.function.param_typeinfo=cpti;
-                    cfn->data.function.param_is_ref=cpref; cfn->data.function.return_type=cr;
-                    cfn->data.function.return_typeinfo=NULL; cfn->line=tmpl->line; cfn->column=tmpl->column;
-                    codegen_function_aarch64(cg,cfn);
-                    cfn->data.function.body=NULL; cfn->data.function.param_names=NULL;
-                    cfn->data.function.param_types=NULL; cfn->data.function.param_typeinfo=NULL;
-                    cfn->data.function.param_is_ref=NULL; cfn->data.function.body_count=0; cfn->data.function.param_count=0;
-                    ast_node_free(cfn); free(cpt); free(cpti);
-                }
-                free(inst); free(csa);
-            }
-            free(gtmpls);
-        }
-
         /* Emit non-generic user functions */
         for (int i = 0; i < program->data.program.function_count; i++) {
             ASTNode *fn = program->data.program.functions[i];
             if (fn->data.function.generic_count > 0) continue;
             codegen_function_aarch64(cg, fn);
         }
+        emit_pending_generic_instantiations(cg);
 
         /* _start entry — only for executables, not library modules */
         if (!cg->module_prefix[0]) {
@@ -4726,6 +7186,9 @@ void codegen_program(CodeGen *cg, ASTNode *program) {
     /* Register struct definitions */
     codegen_register_structs(cg, program);
 
+    /* Register amal impl-block methods */
+    codegen_register_methods(cg, program);
+
     /* Register user function signatures */
     for (int i = 0; i < program->data.program.function_count; i++) {
         ASTNode *fn = program->data.program.functions[i];
@@ -4765,274 +7228,66 @@ void codegen_program(CodeGen *cg, ASTNode *program) {
             if (asm_path) {
                 codegen_emit_native_externs(cg, mod, asm_path);
                 free(asm_path);
+            } else {
+                codegen_emit_module(cg, mod, path);
             }
-            codegen_emit_module(cg, mod, path);
         }
         free(path);
     }
 
     } /* end if(!target_aarch64) — NASM header + externs + module emit done */
 
-    /* ---------------------------------------------------------------
-     * GENERIC MONOMORPHIZATION  (shared: x86-64 and AArch64)
-     * codegen_function() already dispatches to the right backend.
-     * --------------------------------------------------------------- */
-
-    /* 1. Collect generic templates */
-    ASTNode **generic_templates = (ASTNode**)calloc(256, sizeof(ASTNode*));
-    int generic_tmpl_count = 0;
-    for (int i = 0; i < program->data.program.function_count; i++) {
-        ASTNode *fn = program->data.program.functions[i];
-        if (fn->data.function.generic_count > 0 && generic_tmpl_count < 256)
-            generic_templates[generic_tmpl_count++] = fn;
-    }
-
-    if (generic_tmpl_count > 0) {
-        /* 2. Collect call sites using a heap-allocated work stack */
-        typedef struct { char fname[MAX_TOKEN_LEN]; ASTNode *call_node; } CallSite;
-        CallSite *call_sites = (CallSite*)calloc(2048, sizeof(CallSite));
-        int call_site_count = 0;
-
-        ASTNode **work = (ASTNode**)malloc(sizeof(ASTNode*) * 65536);
-        int wtop = 0;
-
-        /* Seed: all statements in all non-generic functions */
-        for (int i = 0; i < program->data.program.function_count; i++) {
-            ASTNode *fn = program->data.program.functions[i];
-            if (fn->data.function.generic_count > 0) continue;
-            for (int j = 0; j < fn->data.function.body_count && wtop < 65530; j++)
-                work[wtop++] = fn->data.function.body[j];
-        }
-
-        /* Walk the AST iteratively */
-        while (wtop > 0) {
-            ASTNode *nd = work[--wtop];
-            if (!nd || wtop >= 65530) continue;
-
-            /* Check if this is a call to a generic template */
-            const char *cname = NULL;
-            ASTNode **cargs = NULL;
-            int cargc = 0;
-            if (nd->type == AST_CALL) {
-                cname = nd->data.call.func_name;
-                cargs = nd->data.call.args;
-                cargc = nd->data.call.arg_count;
+    /* Build selective import table.
+     * - anaw mod::func;  → selective: only that func is unqualified.
+     * - anaw mod;        → wildcard: ALL functions in that module are
+     *                      accessible unqualified (scan func_sig table). */
+    cg->sel_import_count = 0;
+    for (int i = 0; i < program->data.program.import_count; i++) {
+        ASTNode *imp = program->data.program.imports[i];
+        const char *mname = imp->data.import.module_name;
+        if (imp->data.import.is_selective) {
+            /* Explicit selective import */
+            int cnt = imp->data.import.func_name_count;
+            if (cnt == 0) cnt = 1;
+            for (int j = 0; j < cnt && cg->sel_import_count < 1024; j++) {
+                const char *fn = (cnt == 1 && imp->data.import.func_names[0][0] == '\0')
+                                 ? imp->data.import.func_name
+                                 : imp->data.import.func_names[j];
+                if (!fn || fn[0] == '\0') continue;
+                vl_strncpy(cg->sel_import_modules[cg->sel_import_count],
+                           mname, MAX_TOKEN_LEN);
+                vl_strncpy(cg->sel_import_funcs[cg->sel_import_count],
+                           fn, MAX_TOKEN_LEN);
+                cg->sel_import_count++;
             }
-            if (cname) {
-                for (int k = 0; k < generic_tmpl_count; k++) {
-                    if (strcmp(generic_templates[k]->data.function.name, cname)==0
-                        && call_site_count < 2048) {
-                        call_sites[call_site_count].call_node = nd;
-                        strncpy(call_sites[call_site_count].fname,
-                                cname, MAX_TOKEN_LEN-1);
-                        call_site_count++;
-                        break;
+        } else {
+            /* Wildcard import: register every function of this module
+             * so that unqualified calls like color_rgba() work. */
+            char prefix[MAX_TOKEN_LEN*2];
+            snprintf(prefix, sizeof(prefix), "%s__", mname);
+            size_t plen = strlen(prefix);
+            for (int s = 0; s < cg->func_sig_count && cg->sel_import_count < 1024; s++) {
+                const char *sname = cg->func_sigs[s].name;
+                if (strncmp(sname, prefix, plen) != 0) continue;
+                const char *short_name = sname + plen;
+                /* Check not already in table */
+                bool dup = false;
+                for (int d = 0; d < cg->sel_import_count; d++) {
+                    if (strcmp(cg->sel_import_funcs[d], short_name) == 0 &&
+                        strcmp(cg->sel_import_modules[d], mname) == 0) {
+                        dup = true; break;
                     }
                 }
-                for (int a = 0; a < cargc && wtop < 65530; a++)
-                    work[wtop++] = cargs[a];
-            }
-
-            /* Push child nodes */
-            switch (nd->type) {
-                case AST_BINARY_OP:
-                    work[wtop++] = nd->data.binary.left;
-                    work[wtop++] = nd->data.binary.right;
-                    break;
-                case AST_UNARY_OP:
-                    work[wtop++] = nd->data.unary.operand;
-                    break;
-                case AST_IF:
-                    work[wtop++] = nd->data.if_stmt.condition;
-                    for (int j=0;j<nd->data.if_stmt.then_count&&wtop<65530;j++)
-                        work[wtop++] = nd->data.if_stmt.then_stmts[j];
-                    for (int j=0;j<nd->data.if_stmt.else_count&&wtop<65530;j++)
-                        work[wtop++] = nd->data.if_stmt.else_stmts[j];
-                    break;
-                case AST_WHILE:
-                    work[wtop++] = nd->data.while_stmt.condition;
-                    for (int j=0;j<nd->data.while_stmt.body_count&&wtop<65530;j++)
-                        work[wtop++] = nd->data.while_stmt.body[j];
-                    break;
-                case AST_FOR_IN:
-                    for (int j=0;j<nd->data.for_in_stmt.body_count&&wtop<65530;j++)
-                        work[wtop++] = nd->data.for_in_stmt.body[j];
-                    break;
-                case AST_LET:
-                    if (nd->data.let.value) work[wtop++] = nd->data.let.value;
-                    break;
-                case AST_ASSIGN:
-                    if (nd->data.assign.value) work[wtop++] = nd->data.assign.value;
-                    break;
-                case AST_RETURN:
-                    if (nd->data.ret.value) work[wtop++] = nd->data.ret.value;
-                    break;
-                default: break;
+                if (!dup) {
+                    vl_strncpy(cg->sel_import_modules[cg->sel_import_count],
+                               mname, MAX_TOKEN_LEN);
+                    vl_strncpy(cg->sel_import_funcs[cg->sel_import_count],
+                               short_name, MAX_TOKEN_LEN);
+                    cg->sel_import_count++;
+                }
             }
         }
-        free(work);
-
-        /* 3. Track instantiations to avoid duplicates */
-        char (*instantiated)[MAX_TOKEN_LEN*3] =
-            (char(*)[MAX_TOKEN_LEN*3])calloc(512, MAX_TOKEN_LEN*3);
-        int inst_count = 0;
-
-        /* 4. For each call site → derive types → emit once */
-        for (int ci = 0; ci < call_site_count; ci++) {
-            ASTNode *call = call_sites[ci].call_node;
-
-            /* Find template */
-            ASTNode *tmpl = NULL;
-            for (int k = 0; k < generic_tmpl_count; k++)
-                if (strcmp(generic_templates[k]->data.function.name,
-                           call->data.call.func_name)==0)
-                    { tmpl = generic_templates[k]; break; }
-            if (!tmpl) continue;
-
-            int gcount = tmpl->data.function.generic_count;
-
-            /* Infer concrete type for each type param from call arguments */
-            ValueType concrete_types[8];
-            char concrete_names[8][32];
-            for (int g = 0; g < gcount; g++) {
-                concrete_types[g] = TYPE_INT;
-                strcpy(concrete_names[g], "adad");
-            }
-            for (int a = 0; a < call->data.call.arg_count
-                             && a < tmpl->data.function.param_count; a++) {
-                TypeInfo *pti = tmpl->data.function.param_typeinfo
-                                ? tmpl->data.function.param_typeinfo[a] : NULL;
-                if (!pti || pti->generic_name[0] == '\0') continue;
-                for (int g = 0; g < gcount; g++) {
-                    if (strcmp(pti->generic_name,
-                               tmpl->data.function.generic_params[g]) != 0) continue;
-                    ASTNode *arg = call->data.call.args[a];
-                    if (arg->type == AST_FLOAT) {
-                        concrete_types[g] = TYPE_F64;
-                        strcpy(concrete_names[g], "ashari");
-                    } else if (arg->type == AST_IDENTIFIER) {
-                        int vidx = codegen_find_var(cg, arg->data.identifier);
-                        if (vidx >= 0) {
-                            ValueType vt = cg->var_types[vidx];
-                            if      (vt==TYPE_F64)    { concrete_types[g]=TYPE_F64;    strcpy(concrete_names[g],"ashari");   }
-                            else if (vt==TYPE_F32)    { concrete_types[g]=TYPE_F32;    strcpy(concrete_names[g],"ashari32"); }
-                            else if (vt==TYPE_STRING) { concrete_types[g]=TYPE_STRING; strcpy(concrete_names[g],"lafz");     }
-                            else if (vt==TYPE_BOOL)   { concrete_types[g]=TYPE_BOOL;   strcpy(concrete_names[g],"bool");     }
-                            else                      { concrete_types[g]=TYPE_INT;    strcpy(concrete_names[g],"adad");     }
-                        }
-                    }
-                    /* TYPE_INT / AST_INTEGER: default adad already set */
-                    break;
-                }
-            }
-
-            /* Build mangled name: fname__adad or fname__adad__ashari */
-            char mangled[MAX_TOKEN_LEN*3];
-            snprintf(mangled, sizeof(mangled), "%s", tmpl->data.function.name);
-            for (int g = 0; g < gcount; g++) {
-                char part[64];
-                snprintf(part, sizeof(part), "__%s", concrete_names[g]);
-                strncat(mangled, part, sizeof(mangled)-strlen(mangled)-1);
-            }
-
-            /* Patch the call node name in place */
-            strncpy(call->data.call.func_name, mangled, MAX_TOKEN_LEN-1);
-
-            /* Skip if already instantiated */
-            bool already = false;
-            for (int k = 0; k < inst_count; k++)
-                if (strcmp(instantiated[k], mangled)==0) { already=true; break; }
-            if (already) continue;
-            if (inst_count < 512)
-                strncpy(instantiated[inst_count++], mangled, MAX_TOKEN_LEN*3-1);
-
-            /* Build concrete param types by substituting T → concrete */
-            int pcount = tmpl->data.function.param_count;
-            ValueType *cptypes = (ValueType*)malloc(sizeof(ValueType)*pcount);
-            TypeInfo **cpti    = (TypeInfo**)calloc(pcount, sizeof(TypeInfo*));
-            bool      *cpref   = (bool*)calloc(pcount, sizeof(bool));
-            for (int p = 0; p < pcount; p++) {
-                TypeInfo *opti = tmpl->data.function.param_typeinfo
-                                 ? tmpl->data.function.param_typeinfo[p] : NULL;
-                if (opti && opti->generic_name[0]) {
-                    int g2 = -1;
-                    for (int g=0;g<gcount;g++)
-                        if (strcmp(opti->generic_name,
-                                   tmpl->data.function.generic_params[g])==0)
-                            { g2=g; break; }
-                    cptypes[p] = (g2>=0) ? concrete_types[g2]
-                                         : tmpl->data.function.param_types[p];
-                    cpti[p] = NULL;
-                } else {
-                    cptypes[p] = tmpl->data.function.param_types[p];
-                    cpti[p] = typeinfo_clone(opti);
-                }
-                if (tmpl->data.function.param_is_ref)
-                    cpref[p] = tmpl->data.function.param_is_ref[p];
-            }
-
-            /* Concrete return type */
-            TypeInfo *orti = tmpl->data.function.return_typeinfo;
-            ValueType cret = tmpl->data.function.return_type;
-            TypeInfo *crti = NULL;
-            if (orti && orti->generic_name[0]) {
-                int g2 = -1;
-                for (int g=0;g<gcount;g++)
-                    if (strcmp(orti->generic_name,
-                               tmpl->data.function.generic_params[g])==0)
-                        { g2=g; break; }
-                cret = (g2>=0) ? concrete_types[g2] : cret;
-            } else {
-                crti = typeinfo_clone(orti);
-            }
-
-            /* Register signature before emitting */
-            func_sig_add(cg, mangled, cret, crti, cptypes, cpti, pcount);
-            FunctionSig *gsig = func_sig_find(cg, mangled);
-            if (gsig) {
-                gsig->param_is_ref = cpref;
-                for (int g=0;g<gcount;g++) {
-                    strncpy(gsig->generic_params[g],
-                            tmpl->data.function.generic_params[g], MAX_TOKEN_LEN-1);
-                }
-                gsig->generic_count = gcount;
-            }
-
-            /* Build and emit a concrete function node (shares body/names with template) */
-            ASTNode *cfn = ast_node_new(AST_FUNCTION);
-            strncpy(cfn->data.function.name, mangled, MAX_TOKEN_LEN-1);
-            cfn->data.function.generic_count  = 0;
-            cfn->data.function.is_exported    = true;
-            cfn->data.function.body           = tmpl->data.function.body;
-            cfn->data.function.body_count     = tmpl->data.function.body_count;
-            cfn->data.function.param_count    = pcount;
-            cfn->data.function.param_names    = tmpl->data.function.param_names;
-            cfn->data.function.param_types    = cptypes;
-            cfn->data.function.param_typeinfo = cpti;
-            cfn->data.function.param_is_ref   = cpref;
-            cfn->data.function.return_type    = cret;
-            cfn->data.function.return_typeinfo = crti;
-            cfn->line   = tmpl->line;
-            cfn->column = tmpl->column;
-
-            codegen_function(cg, cfn);
-
-            /* Null shared pointers before freeing the wrapper */
-            cfn->data.function.body           = NULL;
-            cfn->data.function.param_names    = NULL;
-            cfn->data.function.param_types    = NULL;
-            cfn->data.function.param_typeinfo = NULL;
-            cfn->data.function.param_is_ref   = NULL;
-            cfn->data.function.return_typeinfo = NULL;
-            cfn->data.function.body_count      = 0;
-            cfn->data.function.param_count     = 0;
-            ast_node_free(cfn);
-        }
-
-        free(instantiated);
-        free(call_sites);
     }
-    free(generic_templates);
 
     /* Emit non-generic user functions */
     for (int i = 0; i < program->data.program.function_count; i++) {
@@ -5040,6 +7295,7 @@ void codegen_program(CodeGen *cg, ASTNode *program) {
         if (fn->data.function.generic_count > 0) continue; /* skip templates */
         codegen_function(cg, fn);
     }
+    emit_pending_generic_instantiations(cg);
 
     /* Entry point */
     codegen_emit(cg,"; ----- entry point -----");

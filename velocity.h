@@ -43,9 +43,9 @@
 #include <stdbool.h>
 #include <stdarg.h>
 
-#define VL_VERSION "0.2.0"
+#define VL_VERSION "0.3.0"
 #define VL_VERSION_MAJOR 0
-#define VL_VERSION_MINOR 2
+#define VL_VERSION_MINOR 3
 #define VL_VERSION_PATCH 0
 
 #define MAX_TOKEN_LEN    256
@@ -78,16 +78,22 @@ typedef enum {
     TOK_CONTINUE,   /* continue / pakh        */
     TOK_ANAW,       /* anaw  - import         */
     TOK_BINA,       /* bina  - struct         */
+    TOK_AMAL,       /* amal  - impl block     */
+    TOK_UNION,      /* union - union          */
+    TOK_TADAD,      /* tadad - enum           */
     TOK_TRY,        /* koshish - try          */
     TOK_CATCH,      /* ratt   - catch        */
     TOK_PANIC,      /* panic                  */
     TOK_THROW,      /* trayith - throw         */
     TOK_APPEND,     /* append                 */
+    TOK_SAABIT,     /* saabit - compile-time constant */
+    TOK_AS,         /* as    - type cast operator     */
 
     /* Types */
     TOK_ADAD,       /* adad    - i64          */
     TOK_UADAD,      /* uadad   - u64          */
     TOK_UADAD8,     /* uadad8  - u8/byte      */
+    TOK_HARF,       /* harf    - char/u8      */
     TOK_ASHARI,     /* ashari  - f64          */
     TOK_ASHARI32,   /* ashari32 - f32         */
     TOK_BOOL,       /* bool                   */
@@ -152,12 +158,14 @@ typedef enum {
     TOK_RBRACE,     /* } */
     TOK_SEMICOLON,  /* ; */
     TOK_COLON,      /* : */
+    TOK_DCOLON,     /* :: path separator for selective imports */
     TOK_COMMA,      /* , */
     TOK_ARROW,      /* -> */
     TOK_DOT,        /* .  */
     TOK_DOTDOT,     /* .. */
     TOK_DOTDOTEQ,   /* ..= */
     TOK_QUESTION,   /* ?  */
+    TOK_DQUESTION,  /* ?? null coalescing */
     TOK_LBRACKET,   /* [  */
     TOK_RBRACKET,   /* ]  */
     TOK_PIPE,       /* |  */
@@ -195,12 +203,16 @@ typedef enum {
     TYPE_OPT_F64,
     TYPE_STRING,
     TYPE_OPT_STRING,
+    TYPE_OPT_STRUCT,   /* bina T?  — null = pointer 0 */
+    TYPE_OPT_ARRAY,    /* [T]?     — null = pointer 0 */
     TYPE_NULL,
     TYPE_VOID,
     TYPE_ARRAY,
     TYPE_TUPLE,
     TYPE_STRUCT,
-    TYPE_ERROR_VAL     /* error type for try/catch */
+    TYPE_ERROR_VAL,    /* error type for try/catch */
+    TYPE_PTR,          /* raw pointer *T  (adad-sized, untyped for now) */
+    TYPE_FUNCPTR       /* function pointer: kar(T1,T2,...) -> R          */
 } ValueType;
 
 /* ------------------------------------------------------------
@@ -220,6 +232,10 @@ typedef struct TypeInfo {
     char generic_name[MAX_TOKEN_LEN]; /* if non-empty: this slot is a type var  */
     int ndim;                     /* number of dimensions (default 1)       */
     int *dim_sizes;               /* sizes per dimension (for fixed nD)     */
+    /* Function pointer signature (TYPE_FUNCPTR) */
+    ValueType fp_return;          /* return type of the pointed-to function */
+    int fp_nparams;               /* number of parameters (0–8)             */
+    ValueType fp_params[8];       /* parameter types                        */
 } TypeInfo;
 
 void typeinfo_free(TypeInfo *ti);
@@ -234,6 +250,7 @@ typedef struct StructDef {
     TypeInfo **field_typeinfo;
     int *field_offsets;
     int field_count;
+    bool is_union;
     int size;
     bool sizing;
 } StructDef;
@@ -283,6 +300,7 @@ typedef enum {
     AST_ASSIGN,
     AST_COMPOUND_ASSIGN,   /* +=, -=, *=, /= */
     AST_FIELD_ASSIGN,
+    AST_FIELD_COMPOUND_ASSIGN,
     AST_ARRAY_ASSIGN,
     AST_IF,
     AST_WHILE,
@@ -313,7 +331,11 @@ typedef enum {
     AST_PANIC,             /* panic("msg") */
     AST_THROW,             /* trayith expr */
     AST_APPEND,            /* arr.append(val) */
-    AST_DISCARD            /* _ = expr */
+    AST_DISCARD,           /* _ = expr */
+    AST_CAST,              /* expr as Type  */
+    AST_CONST_DECL,        /* saabit NAME = literal */
+    AST_DEREF_ASSIGN,      /* *ptr = val  */
+    AST_BLOCK              /* bare { } scoped block */
 } ASTNodeType;
 
 /* ------------------------------------------------------------
@@ -325,11 +347,13 @@ typedef enum {
     /* Bitwise */
     OP_BAND, OP_BOR, OP_BXOR, OP_BNOT, OP_SHL, OP_SHR,
     /* Logical */
-    OP_AND, OP_OR, OP_NOT
+    OP_AND, OP_OR, OP_NOT,
+    /* Null coalescing */
+    OP_COALESCE
 } BinaryOp;
 
 typedef enum {
-    UOP_NEG, UOP_NOT, UOP_BNOT
+    UOP_NEG, UOP_NOT, UOP_BNOT, UOP_ADDR, UOP_DEREF
 } UnaryOp;
 
 /* ------------------------------------------------------------
@@ -407,6 +431,10 @@ typedef struct ASTNode {
 
         struct {
             char module_name[MAX_TOKEN_LEN];
+            char func_name[MAX_TOKEN_LEN];         /* first (or only) selected name */
+            bool is_selective;                     /* true if names are specified    */
+            char func_names[8][MAX_TOKEN_LEN];     /* names from anaw mod::{a,b,c}; */
+            int  func_name_count;                  /* 0=all, 1=single, N=multi      */
         } import;
 
         struct {
@@ -458,8 +486,17 @@ typedef struct ASTNode {
         struct {
             char var_name[MAX_TOKEN_LEN];   /* simple: s.field = val */
             char field_name[MAX_TOKEN_LEN];
+            struct ASTNode *target;         /* full field lvalue when needed */
             struct ASTNode *value;
         } field_assign;
+
+        struct {
+            char var_name[MAX_TOKEN_LEN];
+            char field_name[MAX_TOKEN_LEN];
+            struct ASTNode *target;
+            struct ASTNode *value;
+            BinaryOp op;
+        } field_compound_assign;
 
         struct {
             char var_name[MAX_TOKEN_LEN];
@@ -523,6 +560,9 @@ typedef struct ASTNode {
             /* generics */
             char generic_params[8][MAX_TOKEN_LEN];
             int  generic_count;
+            /* amal impl block */
+            bool is_method;
+            char method_struct[MAX_TOKEN_LEN];
         } function;
 
         struct {
@@ -531,6 +571,7 @@ typedef struct ASTNode {
             ValueType *field_types;
             TypeInfo **field_typeinfo;
             int field_count;
+            bool is_union;
             char generic_params[8][MAX_TOKEN_LEN];
             int  generic_count;
         } struct_def;
@@ -566,8 +607,35 @@ typedef struct ASTNode {
         /* arr.append(val) */
         struct {
             char arr_name[MAX_TOKEN_LEN];
+            /* Optional field chain for `struct.field.append(val);`.
+               Empty string means `arr_name.append(val);` */
+            char field_chain[MAX_TOKEN_LEN];
             struct ASTNode *value;
         } append_stmt;
+
+        /* expr as Type */
+        struct {
+            struct ASTNode *expr;
+            ValueType target_type;
+        } cast;
+
+        /* saabit NAME = literal */
+        struct {
+            char name[MAX_TOKEN_LEN];
+            long long value;
+        } const_decl;
+
+        /* *ptr = val */
+        struct {
+            struct ASTNode *ptr_expr;
+            struct ASTNode *value;
+        } deref_assign;
+
+        /* bare { } scoped block */
+        struct {
+            struct ASTNode **stmts;
+            int count;
+        } block_stmt;
 
     } data;
 } ASTNode;
@@ -648,6 +716,18 @@ typedef struct {
     int try_depth;         /* for try/catch nesting */
     int try_catch_labels[64]; /* catch label stack */
     int error_var_offsets[64]; /* error var offset stack */
+    /* selective import table: anaw mod::func; or wildcard anaw mod; */
+    char sel_import_modules[1024][MAX_TOKEN_LEN];
+    char sel_import_funcs[1024][MAX_TOKEN_LEN];
+    int  sel_import_count;
+    /* global constant table: saabit NAME = val from imported modules */
+    char   gconst_names[1024][MAX_TOKEN_LEN];
+    long long gconst_vals[1024];
+    int    gconst_count;
+    /* amal impl-block method registry: struct_name + short method_name */
+    char method_struct_tab[1024][MAX_TOKEN_LEN];
+    char method_name_tab[1024][MAX_TOKEN_LEN];
+    int  method_count;
 } CodeGen;
 
 /* ------------------------------------------------------------
@@ -669,6 +749,7 @@ typedef struct {
     bool target_aarch64;   /* --target aarch64-linux-android */
     bool keep_asm;
     const char *stdlib_path;
+    const char *extra_link_flags;    /* user linker flags: -lfoo -Lbar ... */
     bool emit_ast;
     bool no_link;
     const char *module_compile_name;  /* --module <name>: compile as a module, prefix funcs */
@@ -678,17 +759,29 @@ typedef struct {
  *  Function Declarations
  * ------------------------------------------------------------ */
 
+/* Error Taxonomy */
+typedef enum {
+    ERR_SYNTAX,
+    ERR_TYPE,
+    ERR_IMPORT,
+    ERR_LINK,
+    ERR_CODEGEN,
+    ERR_SYSTEM,
+    ERR_FATAL
+} ErrorClass;
+
 /* Error / diagnostics */
 ErrorContext error_get_context(void);
 void error_set_context(const char *filename, const char *source);
 void error_restore_context(ErrorContext ctx);
-void error_at(int line, int column, const char *format, ...);
-void error(const char *format, ...);
+void error_at(ErrorClass cls, int line, int column, const char *format, ...);
+void error(ErrorClass cls, const char *format, ...);
 void warn_at(int line, int column, const char *format, ...);
 
 /* Utilities */
 ASTNode* ast_node_new(ASTNodeType type);
 void ast_node_free(ASTNode *node);
+void vl_strncpy(char *dst, const char *src, size_t size);
 const char* token_type_name(VelTokenType type);
 char* read_file(const char *filename);
 char* get_directory(const char *filepath);
@@ -716,6 +809,8 @@ void parser_advance(Parser *parser);
 bool parser_match(Parser *parser, VelTokenType type);
 Token parser_expect(Parser *parser, VelTokenType type);
 ASTNode* parse_program(Parser *parser);
+void     parser_init_no_reset(Parser *parser, Token *tokens, int token_count);
+void     parser_preload_module_consts(const char *vel_file_path);
 
 /* Code Generator */
 void codegen_init(CodeGen *cg, FILE *output, ModuleManager *mgr, bool target_windows, bool target_aarch64, const char *module_prefix);

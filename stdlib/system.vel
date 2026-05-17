@@ -1,0 +1,128 @@
+anaw system;
+
+# ============================================================
+# Velocity System Module v0.3.2
+#
+# Core ASM-backed functions (no wrapper needed — call directly):
+#   system.cmd, system.run, system.exit, system.argc, system.argv,
+#   system.getenv, system.getcwd, system.chdir, system.mkdir,
+#   system.exists, system.rm,
+#   system.getpid, system.getppid,
+#   system.mmap, system.munmap, system.mprotect,
+#   system.sleep, system.usleep,
+#   system.kill,
+#   system.open, system.close, system.read_fd, system.write_fd,
+#   system.seek, system.stat_size, system.ioctl,
+#   system.uname, system.time_ms
+#
+# This file adds high-level helpers/aliases that compile to
+# system__<name> and never collide with ASM symbols.
+# ============================================================
+
+# ---- Shell helpers ------------------------------------------
+
+# sh(command) -> lafz  — alias for system.cmd
+kar sh(command: lafz) -> lafz {
+    chu system__cmd(command);
+}
+
+# ok(command) -> adad  — returns 1 if exit 0, else 0
+kar ok(command: lafz) -> adad {
+    ath code: adad = system__run(command);
+    agar code == 0 {
+        chu 1;
+    }
+    chu 0;
+}
+
+# ---- Environment helpers ------------------------------------
+
+# getenv_safe(key) -> lafz  — returns "" instead of null on miss
+kar getenv_safe(key: lafz) -> lafz {
+    ath v: lafz = system__getenv(key);
+    agar v == 0 {
+        chu "";
+    }
+    chu v;
+}
+
+# ---- Process info aliases -----------------------------------
+
+# pid() -> adad  — alias for system.getpid
+kar pid() -> adad {
+    chu system__getpid();
+}
+
+# ppid() -> adad  — alias for system.getppid
+kar ppid() -> adad {
+    chu system__getppid();
+}
+
+# ---- Timing helpers -----------------------------------------
+# NOTE: system.uname()   and system.time_ms() are backed directly
+#       by system.asm — call them via system.uname() / system.time_ms()
+#       with no wrapper needed.
+
+# sleep_ms(ms) -> khali  — sleep for N milliseconds (convenience alias)
+kar sleep_ms(ms: adad) -> khali {
+    system__usleep(ms * 1000);
+}
+
+# ---- Memory mapping -----------------------------------------
+# NOTE: system.mmap(), system.munmap(), system.mprotect() are backed
+#       by system.asm — call them directly.
+
+# mmap_anon(len, prot) -> adad
+# Convenience: anonymous private mapping at address 0.
+# prot: PROT_RW=3, PROT_READ=1, PROT_RWX=7
+kar mmap_anon(len: adad, prot: adad) -> adad {
+    chu system__mmap(0, len, prot, 34);
+}
+
+# ---- Signal numbers -----------------------------------------
+saabit SIG_HUP  = 1;
+saabit SIG_INT  = 2;
+saabit SIG_QUIT = 3;
+saabit SIG_ABRT = 6;
+saabit SIG_KILL = 9;
+saabit SIG_PIPE = 13;
+saabit SIG_ALRM = 14;
+saabit SIG_TERM = 15;
+saabit SIG_CHLD = 17;
+saabit SIG_CONT = 18;
+saabit SIG_STOP = 19;
+saabit SIG_USR1 = 10;
+saabit SIG_USR2 = 12;
+
+# ---- open() flags (O_* values, Linux x86-64) ----------------
+saabit O_RDONLY   = 0;
+saabit O_WRONLY   = 1;
+saabit O_RDWR     = 2;
+saabit O_CREAT    = 64;
+saabit O_TRUNC    = 512;
+saabit O_APPEND   = 1024;
+saabit O_NONBLOCK = 2048;
+saabit O_CREAT_WR = 577;   # O_WRONLY|O_CREAT|O_TRUNC (common combo)
+
+# ---- Standard file descriptors ------------------------------
+saabit STDIN_FD  = 0;
+saabit STDOUT_FD = 1;
+saabit STDERR_FD = 2;
+
+# ---- seek(whence) values ------------------------------------
+saabit SEEK_SET = 0;
+saabit SEEK_CUR = 1;
+saabit SEEK_END = 2;
+
+# ---- mmap prot / flags --------------------------------------
+saabit PROT_NONE  = 0;
+saabit PROT_READ  = 1;
+saabit PROT_WRITE = 2;
+saabit PROT_EXEC  = 4;
+saabit PROT_RW    = 3;
+saabit PROT_RWX   = 7;
+
+saabit MAP_SHARED    = 1;
+saabit MAP_PRIVATE   = 2;
+saabit MAP_ANONYMOUS = 32;
+saabit MAP_ANON_PRIV = 34;
