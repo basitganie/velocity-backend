@@ -15,6 +15,7 @@
 ;   io__open(path, mode)       - open file, mode: 0=read 1=write 2=append
 ;   io__close(fd_or_handle)    - close file, returns 0 on success
 ;   io__fopen / io__fclose     - aliases of open/close
+;   io__fputc(fd, byte)        - write one byte to fd (C fputc equivalent)
 ; ============================================================
 
 %ifndef WIN64_TARGET
@@ -39,6 +40,10 @@ section .bss
     io_fmt_width    resq 1      ; saved width before parsing precision
     io_tmp_nbuf     resb 48     ; temp buffer for int/hex formatting
     io_file_buf     resb 1048576 ; 1 MB file read buffer
+    ; fputc internal write buffer (8 KB)
+    io_fputc_buf    resb 8192
+    io_fputc_pos    resq 1      ; bytes currently in buffer
+    io_fputc_fd     resq 1      ; fd the buffer belongs to (-1 = none)
 
 section .data
     io_newline  db 10
@@ -63,6 +68,8 @@ extern ReadFile
 extern ExitProcess
 extern CreateFileA
 extern CloseHandle
+extern DeleteFileA
+extern GetLastError
 
 ; helper: write rax=ptr, rcx=len to stdout
 __io_write_win:
@@ -187,6 +194,9 @@ __io_print_str_raw:
 %else
     mov  r12, rdi
 %endif
+    ; Treat null pointer as empty string to avoid crashes on "%s" with null.
+    test r12, r12
+    jz   .done
     xor  rbx, rbx
 .len_loop:
     mov  al, [r12 + rbx]
@@ -1975,11 +1985,19 @@ global io__close
 io__close:
     push rbp
     mov  rbp, rsp
+    push rbx
 %ifdef WIN64_TARGET
-    ; rcx = HANDLE
-    sub  rsp, 32
+    mov  rbx, rcx
+    ; flush fputc buffer if it belongs to this handle
+    mov  rax, [rel io_fputc_fd]
+    cmp  rax, rbx
+    jne  .close_no_flush_win
+    call __io_fputc_flush_raw
+.close_no_flush_win:
+    sub  rsp, 40
+    mov  rcx, rbx
     call CloseHandle
-    add  rsp, 32
+    add  rsp, 40
     test rax, rax
     jnz  .close_ok_win
     mov  rax, -1
@@ -1987,11 +2005,19 @@ io__close:
 .close_ok_win:
     xor  rax, rax
 %else
-    ; rdi = fd
+    mov  rbx, rdi
+    ; flush fputc buffer if it belongs to this fd
+    mov  rax, [rel io_fputc_fd]
+    cmp  rax, rbx
+    jne  .close_no_flush
+    call __io_fputc_flush_raw
+.close_no_flush:
     mov  rax, 3            ; sys_close
+    mov  rdi, rbx
     syscall                ; returns 0 or -errno
 %endif
 .close_done:
+    pop  rbx
     mov  rsp, rbp
     pop  rbp
     ret
@@ -2070,6 +2096,112 @@ io__write:
     pop  rbp
     ret
 
+; -- io__fputc(fd_or_handle: adad, byte: adad) -> adad --------------
+; Write a single byte to any open file descriptor / HANDLE.
+; Equivalent to C's fputc(c, stream) but takes an fd/HANDLE instead.
+;   fputc(fd, 255)   →  io__fputc(fd, 0xFF)
+;   fputc(fd, 0xff)  →  same
+;   fputc(fd, 'A')   →  io__fputc(fd, 65)
+; Returns the byte written (as unsigned 0-255) on success, or -1 on error.
+;
+; Calling convention:
+;   Linux   : rdi = fd,     rsi = byte value (only low 8 bits used)
+;   Windows : rcx = HANDLE, rdx = byte value (only low 8 bits used)
+; -- __io_fputc_flush_raw (internal) --------------------------------
+; Flushes io_fputc_buf to io_fputc_fd unconditionally.
+; Trashes rax/rdi/rsi/rdx. No frame needed.
+__io_fputc_flush_raw:
+    mov  rdx, [rel io_fputc_pos]
+    test rdx, rdx
+    jz   .flush_empty
+%ifdef WIN64_TARGET
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    sub  rsp, 56
+    mov  qword [rsp + 40], 0
+    mov  qword [rsp + 32], 0
+    mov  rcx, [rel io_fputc_fd]
+    lea  rdx, [rel io_fputc_buf]
+    mov  r8,  [rel io_fputc_pos]
+    lea  r9,  [rsp + 40]
+    call WriteFile
+    add  rsp, 56
+    pop  r12
+    pop  rbx
+    mov  rsp, rbp
+    pop  rbp
+%else
+    mov  rax, 1
+    mov  rdi, [rel io_fputc_fd]
+    lea  rsi, [rel io_fputc_buf]
+    ; rdx already = io_fputc_pos
+    syscall
+%endif
+    mov  qword [rel io_fputc_pos], 0
+.flush_empty:
+    ret
+
+; -- io__fputc(fd, byte) -> adad ------------------------------------
+; Buffered: accumulates into an 8 KB buffer, flushes when full
+; or when the fd changes. io__close flushes automatically.
+;   Linux   : rdi = fd,     rsi = byte
+;   Windows : rcx = HANDLE, rdx = byte
+global io__fputc
+io__fputc:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+%ifdef WIN64_TARGET
+    mov  rbx, rcx
+    movzx r12, dl
+%else
+    mov  rbx, rdi
+    movzx r12, sil
+%endif
+    ; if fd differs from buffered fd, flush first
+    mov  rax, [rel io_fputc_fd]
+    cmp  rax, rbx
+    je   .same_fd
+    mov  rax, [rel io_fputc_pos]
+    test rax, rax
+    jz   .set_fd
+    call __io_fputc_flush_raw
+.set_fd:
+    mov  [rel io_fputc_fd], rbx
+.same_fd:
+    ; store byte into buffer
+    mov  rax, [rel io_fputc_pos]
+    lea  rdx, [rel io_fputc_buf]
+    mov  byte [rdx + rax], r12b
+    inc  rax
+    mov  [rel io_fputc_pos], rax
+    ; flush if buffer full
+    cmp  rax, 8192
+    jl   .no_flush
+    call __io_fputc_flush_raw
+.no_flush:
+    movzx rax, r12b
+    pop  r12
+    pop  rbx
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; -- io__fputc_flush() -> khali -------------------------------------
+; Public flush — call before switching fds or closing.
+; io__close calls this automatically.
+global io__fputc_flush
+io__fputc_flush:
+    push rbp
+    mov  rbp, rsp
+    call __io_fputc_flush_raw
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
 ; -- io__getchar() → adad (reads one byte from stdin, -1 on EOF) -----
 global io__getchar
 io__getchar:
@@ -2135,7 +2267,8 @@ io__file_read:
     push r12
 %ifdef WIN64_TARGET
     mov  r12, rcx           ; path
-    sub  rsp, 56
+    ; Win64 ABI: keep RSP 16-byte aligned at call sites and reserve shadow space.
+    sub  rsp, 64
     mov  rcx, r12
     mov  rdx, 0x80000000   ; GENERIC_READ
     mov  r8,  1             ; FILE_SHARE_READ
@@ -2144,30 +2277,47 @@ io__file_read:
     mov  qword [rsp + 40], 0x80
     mov  qword [rsp + 48], 0
     call CreateFileA
-    add  rsp, 56
+    add  rsp, 64
     cmp  rax, -1
     je   .fr_err_win
     mov  rbx, rax           ; rbx = handle
-    sub  rsp, 24
-    mov  qword [rsp], 0
+    ; Reserve shadow space + 5th arg + bytesRead (as qword) and keep alignment.
+    sub  rsp, 48
+    mov  qword [rsp + 40], 0          ; bytesRead (qword)
     mov  rcx, rbx
     lea  rdx, [rel io_file_buf]
     mov  r8,  1048575
-    lea  r9,  [rsp]
-    push qword 0
+    lea  r9,  [rsp + 40]              ; &bytesRead
+    mov  qword [rsp + 32], 0          ; lpOverlapped = NULL (5th arg)
     call ReadFile
-    mov  r12, [rsp + 8]     ; bytes read
-    add  rsp, 16
-    mov  byte [rel io_file_buf + r12], 0
+    ; if ReadFile failed, return empty string
+    test eax, eax
+    jnz  .fr_read_ok_win
+    add  rsp, 48
+    lea  rax, [rel io_file_buf]
+    mov  byte [rax], 0
     mov  rcx, rbx
+    sub  rsp, 32
     call CloseHandle
+    add  rsp, 32
+    lea  rax, [rel io_file_buf]
+    jmp  .fr_done_win
+.fr_read_ok_win:
+    mov  r12, [rsp + 40]    ; bytes read
+    add  rsp, 48
+    lea  rdx, [rel io_file_buf]
+    mov  byte [rdx + r12], 0
+    mov  rcx, rbx
+    sub  rsp, 32
+    call CloseHandle
+    add  rsp, 32
     lea  rax, [rel io_file_buf]
     jmp  .fr_done_win
 .fr_err_win:
     lea  rax, [rel io_file_buf]
     mov  byte [rax], 0
 .fr_done_win:
-    add  rsp, 8
+    ; no extra stack to pop in win path
 %else
     mov  r12, rdi           ; path
     mov  rax, 2             ; sys_open
@@ -2186,7 +2336,8 @@ io__file_read:
     mov  r12, rax
     test r12, r12
     js   .fr_read_err
-    mov  byte [rel io_file_buf + r12], 0
+    lea  rdx, [rel io_file_buf]
+    mov  byte [rdx + r12], 0
     mov  rax, 3             ; sys_close
     mov  rdi, rbx
     syscall
@@ -2218,6 +2369,7 @@ io__file_write:
 %ifdef WIN64_TARGET
     mov  r12, rcx           ; path
     mov  r13, rdx           ; content
+    ; Keep RSP aligned and reserve shadow space for WinAPI calls.
     sub  rsp, 56
     mov  rcx, r12
     mov  rdx, 0x40000000   ; GENERIC_WRITE
@@ -2235,23 +2387,26 @@ io__file_write:
     mov  rcx, r13
     call __io_strlen
     mov  r12, rax           ; length
-    sub  rsp, 24
-    mov  qword [rsp], 0
+    ; shadow + 5th arg + bytesWritten
+    sub  rsp, 56
+    mov  qword [rsp + 48], 0          ; bytesWritten
     mov  rcx, rbx
     mov  rdx, r13
     mov  r8,  r12
-    lea  r9,  [rsp]
-    push qword 0
+    lea  r9,  [rsp + 48]              ; &bytesWritten
+    mov  qword [rsp + 32], 0          ; lpOverlapped = NULL
     call WriteFile
-    add  rsp, 16
+    add  rsp, 56
     mov  rcx, rbx
+    sub  rsp, 40
     call CloseHandle
+    add  rsp, 40
     xor  rax, rax
     jmp  .fw_done_win
 .fw_err_win:
     mov  rax, -1
 .fw_done_win:
-    add  rsp, 8
+    ; no extra stack to pop in win path
 %else
     mov  r12, rdi           ; path
     mov  r13, rsi           ; content
@@ -2297,7 +2452,7 @@ io__file_exists:
     push rbp
     mov  rbp, rsp
 %ifdef WIN64_TARGET
-    sub  rsp, 56
+    sub  rsp, 64
     mov  rdx, 0x80000000
     mov  r8,  1
     xor  r9,  r9
@@ -2305,13 +2460,13 @@ io__file_exists:
     mov  qword [rsp + 40], 0x80
     mov  qword [rsp + 48], 0
     call CreateFileA
-    add  rsp, 56
+    add  rsp, 64
     cmp  rax, -1
     je   .fex_no
-    push rax
     mov  rcx, rax
+    sub  rsp, 32
     call CloseHandle
-    pop  rax
+    add  rsp, 32
     mov  rax, 1
     jmp  .fex_done
 .fex_no:
@@ -2335,19 +2490,12 @@ io__file_delete:
     push rbp
     mov  rbp, rsp
 %ifdef WIN64_TARGET
+    ; DeleteFileA(lpFileName) → nonzero on success
+    ; Win64 shadow space (32) and keep alignment.
+    sub  rsp, 32
     call DeleteFileA
-    xor  rdx, rdx
-    test rax, rax
-    setz dl
-    lea  rax, [rdx - 1]    ; 0→-1 if failed, else 0
-    not  rax
-    and  rax, rdx
-    ; simpler: if DeleteFileA returns nonzero → success(0), else -1
-    mov  rax, rcx           ; was already clobbered, redo
-    sub  rsp, 40
-    call DeleteFileA
-    add  rsp, 40
-    test rax, rax
+    add  rsp, 32
+    test eax, eax
     jnz  .fdel_ok
     mov  rax, -1
     jmp  .fdel_done
@@ -2373,6 +2521,7 @@ io__file_append:
 %ifdef WIN64_TARGET
     mov  r12, rcx
     mov  r13, rdx
+    ; Keep RSP aligned and reserve shadow space for WinAPI calls.
     sub  rsp, 56
     mov  rcx, r12
     mov  rdx, 0x00100004   ; FILE_APPEND_DATA
@@ -2389,23 +2538,25 @@ io__file_append:
     mov  rcx, r13
     call __io_strlen
     mov  r12, rax
-    sub  rsp, 24
-    mov  qword [rsp], 0
+    sub  rsp, 56
+    mov  qword [rsp + 48], 0
     mov  rcx, rbx
     mov  rdx, r13
     mov  r8,  r12
-    lea  r9,  [rsp]
-    push qword 0
+    lea  r9,  [rsp + 48]
+    mov  qword [rsp + 32], 0
     call WriteFile
-    add  rsp, 16
+    add  rsp, 56
     mov  rcx, rbx
+    sub  rsp, 40
     call CloseHandle
+    add  rsp, 40
     xor  rax, rax
     jmp  .fa_done_win
 .fa_err_win:
     mov  rax, -1
 .fa_done_win:
-    add  rsp, 8
+    ; no extra stack to pop in win path
 %else
     mov  r12, rdi
     mov  r13, rsi

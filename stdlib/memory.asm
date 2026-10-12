@@ -3,6 +3,12 @@
 ; Low-level memory primitives for self-hosting + systems programming
 ; ================================================================
 
+%ifndef WIN64_TARGET
+%ifidni __OUTPUT_FORMAT__,win64
+  %define WIN64_TARGET 1
+%endif
+%endif
+
 %ifdef WIN64_TARGET
   %define ARG1 rcx
   %define ARG2 rdx
@@ -14,6 +20,8 @@
   %define ARG3 rdx
   %define ARG4 rcx
 %endif
+
+default rel
 
 section .text
 
@@ -87,9 +95,9 @@ _vel_mem__malloc:
     push rbp
     mov  rbp, rsp
 %ifdef WIN64_TARGET
-    sub  rsp, 40
+    sub  rsp, 32
     call malloc
-    add  rsp, 40
+    add  rsp, 32
 %else
     call malloc
 %endif
@@ -103,9 +111,9 @@ _vel_mem__calloc:
     push rbp
     mov  rbp, rsp
 %ifdef WIN64_TARGET
-    sub  rsp, 40
+    sub  rsp, 32
     call calloc
-    add  rsp, 40
+    add  rsp, 32
 %else
     call calloc
 %endif
@@ -119,9 +127,9 @@ _vel_mem__realloc:
     push rbp
     mov  rbp, rsp
 %ifdef WIN64_TARGET
-    sub  rsp, 40
+    sub  rsp, 32
     call realloc
-    add  rsp, 40
+    add  rsp, 32
 %else
     call realloc
 %endif
@@ -135,9 +143,9 @@ _vel_mem__free:
     push rbp
     mov  rbp, rsp
 %ifdef WIN64_TARGET
-    sub  rsp, 40
+    sub  rsp, 32
     call free
-    add  rsp, 40
+    add  rsp, 32
 %else
     call free
 %endif
@@ -152,9 +160,9 @@ _vel_mem__memcpy:
     push rbp
     mov  rbp, rsp
 %ifdef WIN64_TARGET
-    sub  rsp, 40
+    sub  rsp, 32
     call memcpy
-    add  rsp, 40
+    add  rsp, 32
 %else
     push rdi           ; save dst (return value)
     call memcpy
@@ -170,9 +178,9 @@ _vel_mem__memmove:
     push rbp
     mov  rbp, rsp
 %ifdef WIN64_TARGET
-    sub  rsp, 40
+    sub  rsp, 32
     call memmove
-    add  rsp, 40
+    add  rsp, 32
 %else
     push rdi
     call memmove
@@ -188,9 +196,9 @@ _vel_mem__memset:
     push rbp
     mov  rbp, rsp
 %ifdef WIN64_TARGET
-    sub  rsp, 40
+    sub  rsp, 32
     call memset
-    add  rsp, 40
+    add  rsp, 32
 %else
     push rdi
     ; rsi=val(int), rdx=n  → C memset(ptr, val, n) same regs
@@ -207,9 +215,9 @@ _vel_mem__memcmp:
     push rbp
     mov  rbp, rsp
 %ifdef WIN64_TARGET
-    sub  rsp, 40
+    sub  rsp, 32
     call memcmp
-    add  rsp, 40
+    add  rsp, 32
 %else
     call memcmp
 %endif
@@ -223,9 +231,9 @@ _vel_mem__strlen:
     push rbp
     mov  rbp, rsp
 %ifdef WIN64_TARGET
-    sub  rsp, 40
+    sub  rsp, 32
     call strlen
-    add  rsp, 40
+    add  rsp, 32
 %else
     call strlen
 %endif
@@ -239,9 +247,9 @@ _vel_mem__strcmp:
     push rbp
     mov  rbp, rsp
 %ifdef WIN64_TARGET
-    sub  rsp, 40
+    sub  rsp, 32
     call strcmp
-    add  rsp, 40
+    add  rsp, 32
 %else
     call strcmp
 %endif
@@ -255,9 +263,9 @@ _vel_mem__strcpy:
     push rbp
     mov  rbp, rsp
 %ifdef WIN64_TARGET
-    sub  rsp, 40
+    sub  rsp, 32
     call strcpy
-    add  rsp, 40
+    add  rsp, 32
 %else
     push rdi
     call strcpy
@@ -273,9 +281,9 @@ _vel_mem__strncpy:
     push rbp
     mov  rbp, rsp
 %ifdef WIN64_TARGET
-    sub  rsp, 40
+    sub  rsp, 32
     call strncpy
-    add  rsp, 40
+    add  rsp, 32
 %else
     push rdi
     call strncpy
@@ -291,9 +299,9 @@ _vel_mem__strcat:
     push rbp
     mov  rbp, rsp
 %ifdef WIN64_TARGET
-    sub  rsp, 40
+    sub  rsp, 32
     call strcat
-    add  rsp, 40
+    add  rsp, 32
 %else
     push rdi
     call strcat
@@ -309,9 +317,9 @@ _vel_mem__strncat:
     push rbp
     mov  rbp, rsp
 %ifdef WIN64_TARGET
-    sub  rsp, 40
+    sub  rsp, 32
     call strncat
-    add  rsp, 40
+    add  rsp, 32
 %else
     push rdi
     call strncat
@@ -327,9 +335,9 @@ _vel_mem__strdup:
     push rbp
     mov  rbp, rsp
 %ifdef WIN64_TARGET
-    sub  rsp, 40
+    sub  rsp, 32
     call _strdup
-    add  rsp, 40
+    add  rsp, 32
 %else
     call strdup
 %endif
@@ -383,4 +391,8 @@ section .data
     extern strncpy
     extern strcat
     extern strncat
+%ifdef WIN64_TARGET
+    extern _strdup
+%else
     extern strdup
+%endif

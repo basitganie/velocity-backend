@@ -1,0 +1,193 @@
+# =============================================================================
+# Velocity Standard Library — SQLite3 High-Level API (sqlite3.vel)
+# =============================================================================
+
+# Standard SQLite Result Codes
+saabit SQLITE_OK          = 0;
+saabit SQLITE_ERROR       = 1;
+saabit SQLITE_INTERNAL    = 2;
+saabit SQLITE_PERM        = 3;
+saabit SQLITE_ABORT       = 4;
+saabit SQLITE_BUSY        = 5;
+saabit SQLITE_LOCKED      = 6;
+saabit SQLITE_NOMEM       = 7;
+saabit SQLITE_READONLY    = 8;
+saabit SQLITE_INTERRUPT   = 9;
+saabit SQLITE_IOERR       = 10;
+saabit SQLITE_CORRUPT     = 11;
+saabit SQLITE_FULL        = 13;
+saabit SQLITE_CANTOPEN    = 14;
+saabit SQLITE_CONSTRAINT  = 19;
+
+# Step Status
+saabit SQLITE_ROW         = 100;
+saabit SQLITE_DONE        = 101;
+
+# Column Data Types
+saabit SQLITE_INTEGER     = 1;
+saabit SQLITE_FLOAT       = 2;
+saabit SQLITE_TEXT        = 3;
+saabit SQLITE_BLOB        = 4;
+saabit SQLITE_NULL        = 5;
+
+# Open Flags
+saabit SQLITE_OPEN_READONLY     = 1;
+saabit SQLITE_OPEN_READWRITE    = 2;
+saabit SQLITE_OPEN_CREATE       = 4;
+saabit SQLITE_OPEN_MEMORY       = 128;
+
+# ---- Database Connection ----
+kar open(path: lafz) -> adad {
+    chu sqlite3__open(path);
+}
+
+kar open_v2(path: lafz, flags: adad) -> adad {
+    chu sqlite3__open_v2(path, flags);
+}
+
+kar close(db: adad) -> adad {
+    chu sqlite3__close(db);
+}
+
+kar close_v2(db: adad) -> adad {
+    chu sqlite3__close_v2(db);
+}
+
+kar errmsg(db: adad) -> lafz {
+    chu sqlite3__errmsg(db);
+}
+
+kar errcode(db: adad) -> adad {
+    chu sqlite3__errcode(db);
+}
+
+kar changes(db: adad) -> adad {
+    chu sqlite3__changes(db);
+}
+
+kar total_changes(db: adad) -> adad {
+    chu sqlite3__total_changes(db);
+}
+
+kar last_insert_rowid(db: adad) -> adad {
+    chu sqlite3__last_insert_rowid(db);
+}
+
+kar libversion() -> lafz {
+    chu sqlite3__libversion();
+}
+
+# ---- Direct Execution ----
+kar exec(db: adad, sql: lafz) -> adad {
+    chu sqlite3__exec(db, sql);
+}
+
+# ---- Prepared Statements ----
+kar prepare(db: adad, sql: lafz) -> adad {
+    chu sqlite3__prepare(db, sql);
+}
+
+kar step(stmt: adad) -> adad {
+    chu sqlite3__step(stmt);
+}
+
+kar reset(stmt: adad) -> adad {
+    chu sqlite3__reset(stmt);
+}
+
+kar finalize(stmt: adad) -> adad {
+    chu sqlite3__finalize(stmt);
+}
+
+# ---- Column Value Accessors ----
+kar column_count(stmt: adad) -> adad {
+    chu sqlite3__column_count(stmt);
+}
+
+kar column_name(stmt: adad, col: adad) -> lafz {
+    chu sqlite3__column_name(stmt, col);
+}
+
+kar column_type(stmt: adad, col: adad) -> adad {
+    chu sqlite3__column_type(stmt, col);
+}
+
+kar column_int(stmt: adad, col: adad) -> adad {
+    chu sqlite3__column_int(stmt, col);
+}
+
+kar column_text(stmt: adad, col: adad) -> lafz {
+    chu sqlite3__column_text(stmt, col);
+}
+
+kar column_float(stmt: adad, col: adad) -> ashari {
+    chu sqlite3__column_float(stmt, col);
+}
+
+kar column_bytes(stmt: adad, col: adad) -> adad {
+    chu sqlite3__column_bytes(stmt, col);
+}
+
+# ---- Parameter Binding ----
+kar bind_int(stmt: adad, idx: adad, val: adad) -> adad {
+    chu sqlite3__bind_int(stmt, idx, val);
+}
+
+kar bind_text(stmt: adad, idx: adad, val: lafz) -> adad {
+    chu sqlite3__bind_text(stmt, idx, val);
+}
+
+kar bind_float(stmt: adad, idx: adad, val: ashari) -> adad {
+    chu sqlite3__bind_float(stmt, idx, val);
+}
+
+kar bind_null(stmt: adad, idx: adad) -> adad {
+    chu sqlite3__bind_null(stmt, idx);
+}
+
+kar clear_bindings(stmt: adad) -> adad {
+    chu sqlite3__clear_bindings(stmt);
+}
+
+# ---- High-Level Convenience Helpers ----
+kar is_row(rc: adad) -> bool {
+    chu rc == SQLITE_ROW;
+}
+
+kar is_done(rc: adad) -> bool {
+    chu rc == SQLITE_DONE;
+}
+
+kar is_ok(rc: adad) -> bool {
+    chu rc == SQLITE_OK;
+}
+
+# Execute a query expecting a single integer (e.g. "SELECT COUNT(*) FROM table")
+kar query_single_int(db: adad, sql: lafz) -> adad {
+    ath stmt = prepare(db, sql);
+    agar stmt == 0 {
+        chu 0;
+    }
+    ath mut result = 0;
+    ath rc = step(stmt);
+    agar rc == SQLITE_ROW {
+        result = column_int(stmt, 0);
+    }
+    finalize(stmt);
+    chu result;
+}
+
+# Execute a query expecting a single text string
+kar query_single_text(db: adad, sql: lafz) -> lafz {
+    ath stmt = prepare(db, sql);
+    agar stmt == 0 {
+        chu 0 as lafz;
+    }
+    ath mut result: lafz = 0 as lafz;
+    ath rc = step(stmt);
+    agar rc == SQLITE_ROW {
+        result = column_text(stmt, 0);
+    }
+    finalize(stmt);
+    chu result;
+}

@@ -1,0 +1,171 @@
+anaw hashmap;
+
+# ================================================================
+# hashmap — generic open-addressing hash map
+# Kashmiri Edition v2 — v0.3.1
+#
+# Key type:   lafz  (string)
+# Value types: adad (i64), ashari (f64), lafz (string)
+#   stored as a tagged union — one map can hold all three types
+#   in different keys simultaneously.
+#
+# Usage:
+#   ath mut m = hashmap.new(16);        # create with initial capacity
+#   hashmap.set_int(m, "score", 42);
+#   hashmap.set_str(m, "naam", "Ahmad");
+#   hashmap.set_float(m, "ratio", 3.14);
+#
+#   ath score = hashmap.get_int(m, "score");      # 42
+#   ath naam  = hashmap.get_str(m, "naam");       # "Ahmad"
+#   ath found = hashmap.has(m, "score");          # 1
+#   ath n     = hashmap.count(m);                 # 3
+#   hashmap.delete(m, "score");
+#   hashmap.clear(m);
+#   hashmap.free(m);
+#
+# Tag constants (for advanced use):
+#   hashmap.TAG_INT   = 0
+#   hashmap.TAG_FLOAT = 1
+#   hashmap.TAG_STR   = 2
+# ================================================================
+
+# ---- Tag constants (value-type discriminant) ---------------------
+
+saabit TAG_INT = 0;
+saabit TAG_FLOAT = 1;
+saabit TAG_STR = 2;
+
+# ---- Lifecycle --------------------------------------------------
+
+# new(initial_cap) -> adad
+#   Create a new map. initial_cap is rounded up to the nearest
+#   power of 2 (minimum 16). Returns an opaque handle (pointer).
+kar new(initial_cap: adad) -> adad {
+    chu hashmap__new(initial_cap);
+}
+
+# free(map) -> khali
+#   Destroy the map and release all memory (keys + slots + header).
+kar free(map: adad) -> khali {
+    hashmap__free(map);
+}
+
+# ---- Insert / Update --------------------------------------------
+
+# set_int(map, key, val) -> khali
+#   Insert or update an integer value.
+kar set_int(map: adad, key: lafz, val: adad) -> khali {
+    hashmap__set_int(map, key, val);
+}
+
+# set_float(map, key, val) -> khali
+#   Insert or update a float value.
+kar set_float(map: adad, key: lafz, val: ashari) -> khali {
+    hashmap__set_float(map, key, val);
+}
+
+# set_str(map, key, val) -> khali
+#   Insert or update a string value.
+#   The value pointer is stored as-is (not copied); caller owns the string.
+kar set_str(map: adad, key: lafz, val: lafz) -> khali {
+    hashmap__set_str(map, key, val);
+}
+
+# ---- Lookup -----------------------------------------------------
+
+# get_int(map, key) -> adad
+#   Returns the integer stored at key, or 0 if not found or wrong type.
+kar get_int(map: adad, key: lafz) -> adad {
+    chu hashmap__get_int(map, key);
+}
+
+# bits_to_float(bits) -> ashari
+#   Internal bridge: converts raw 64-bit float bits (adad) → ashari.
+#   The ASM moves the bits into xmm0; declaring it here as -> ashari
+#   lets the codegen emit movsd (not cvtsi2sd) at the call site.
+kar bits_to_float(bits: adad) -> ashari {
+    chu hashmap__bits_to_float(bits);
+}
+
+# get_float(map, key) -> ashari
+#   Returns the float stored at key, or 0.0 if not found or wrong type.
+#
+#   Two-step bridge: hashmap__get_float returns raw bits as adad (so
+#   codegen's TYPE_INT fallback is correct), then bits_to_float moves
+#   those bits into xmm0 so Velocity sees a proper ashari return.
+kar get_float(map: adad, key: lafz) -> ashari {
+    ath bits: adad = hashmap__get_float(map, key);
+    chu bits_to_float(bits);
+}
+
+# get_str(map, key) -> lafz
+#   Returns the string stored at key, or 0 (null) if not found or wrong type.
+kar get_str(map: adad, key: lafz) -> lafz {
+    chu hashmap__get_str(map, key);
+}
+
+# ---- Query / Mutation -------------------------------------------
+
+# has(map, key) -> adad
+#   Returns 1 if the key exists, 0 otherwise.
+kar has(map: adad, key: lafz) -> adad {
+    chu hashmap__has(map, key);
+}
+
+# delete(map, key) -> adad
+#   Remove a key. Returns 1 if it was found and deleted, 0 if not found.
+kar delete(map: adad, key: lafz) -> adad {
+    chu hashmap__delete(map, key);
+}
+
+# count(map) -> adad
+#   Number of live entries currently in the map.
+kar count(map: adad) -> adad {
+    chu hashmap__count(map);
+}
+
+# clear(map) -> khali
+#   Remove all entries without freeing the map itself.
+#   Capacity is preserved; the map can be reused immediately.
+kar clear(map: adad) -> khali {
+    hashmap__clear(map);
+}
+
+# ---- Type helpers -----------------------------------------------
+
+# get_tag(map, key) -> adad
+#   Returns the type tag of the value at key:
+#     0 = adad, 1 = ashari, 2 = lafz
+#   Returns -1 if the key is not found.
+#   Useful for inspecting mixed-type maps.
+kar get_tag(map: adad, key: lafz) -> adad {
+    ath found: adad = hashmap__has(map, key);
+    agar found == 0 {
+        chu 0 - 1;
+    }
+    # has() confirmed key exists — read tag directly via a sentinel trick:
+    # fall through to get_int; if wrong type returns 0 that's fine for tag
+    # Actually: we need direct tag access. Call a helper.
+    chu hashmap__get_tag(map, key);
+}
+
+# is_int(map, key) -> adad
+kar is_int(map: adad, key: lafz) -> adad {
+    ath t: adad = hashmap__get_tag(map, key);
+    agar t == TAG_INT { chu 1; }
+    chu 0;
+}
+
+# is_float(map, key) -> adad
+kar is_float(map: adad, key: lafz) -> adad {
+    ath t: adad = hashmap__get_tag(map, key);
+    agar t == TAG_FLOAT { chu 1; }
+    chu 0;
+}
+
+# is_str(map, key) -> adad
+kar is_str(map: adad, key: lafz) -> adad {
+    ath t: adad = hashmap__get_tag(map, key);
+    agar t == TAG_STR { chu 1; }
+    chu 0;
+}

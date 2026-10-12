@@ -1,26 +1,27 @@
 # Velocity Standard Library - Util Module
 # General utility functions
+anaw lafz;
 
-kar util__is_digit(c: adad) -> bool {
+kar util__is_digit(c: harf) -> bool {
     chu c >= 48 wa c <= 57;
 }
 
-kar util__is_alpha(c: adad) -> bool {
+kar util__is_alpha(c: harf) -> bool {
     chu (c >= 65 wa c <= 90) ya (c >= 97 wa c <= 122);
 }
 
-kar util__is_space(c: adad) -> bool {
+kar util__is_space(c: harf) -> bool {
     chu c == 32 ya c == 9 ya c == 10 ya c == 13;
 }
 
-kar util__to_upper(c: adad) -> adad {
+kar util__to_upper(c: harf) -> adad {
     agar c >= 97 wa c <= 122 {
         chu c - 32;
     }
     chu c;
 }
 
-kar util__to_lower(c: adad) -> adad {
+kar util__to_lower(c: harf) -> adad {
     agar c >= 65 wa c <= 90 {
         chu c + 32;
     }
@@ -58,4 +59,43 @@ kar util__clamp(x: adad, lo: adad, hi: adad) -> adad {
     agar x < lo { chu lo; }
     agar x > hi { chu hi; }
     chu x;
+}
+
+kar to_lower_str(str: lafz)->lafz{
+    ath mut temp: [harf] = [];
+    bar i manz 0..len(str){
+        ath mut c: harf = lafz.char_at(str, i);
+        agar c as uadad >= 65 wa c as uadad <= 90{
+            c += 32;
+            temp.append(c);
+        }nate{
+            temp.append(c);
+        }
+    }
+    temp as lafz;
+}
+
+kar to_upper_str(str: lafz)->lafz{
+    ath mut temp: [harf] = [];
+    bar i manz 0..len(str){
+        ath mut c: harf = lafz.char_at(str, i);
+        agar c as uadad >= 97 wa c as uadad <= 122{
+            c -= 32;
+            temp.append(c);
+        }nate{
+            temp.append(c);
+        }
+    }
+    temp as lafz;
+}
+
+kar eval(src: lafz)->adad?{
+    ath mut res = null;
+    bar i in 0..len(src){
+        ath c: harf = lafz.char_at(src, i);
+        if util__is_digit(c){
+            
+        }
+    }
+    chu res;
 }

@@ -1,0 +1,333 @@
+# Standard JSON Parser for Velocity
+# Dict is heap-allocated; all functions take adad (raw pointer).
+# Layout: [+0]=keys_ptr [+8]=vals_ptr [+16]=count
+# keys and vals are arrays of lafz (pointer arrays).
+
+anaw io;
+anaw lafz;
+anaw memory;
+
+saabit DICT_CAP = 64;
+
+# =========================================
+# DICT CORE  (pointer-based, no structs)
+# =========================================
+
+# Allocate a new Dict on the heap, return its adad address.
+kar dict_new() -> adad {
+    ath d = memory.malloc(24);          # 3 fields * 8 bytes
+    # allocate keys and vals arrays: DICT_CAP * 8 bytes each
+    ath keys = memory.malloc(DICT_CAP * 8);
+    ath vals = memory.malloc(DICT_CAP * 8);
+    # zero-fill with empty strings
+    ath mut i = 0;
+    yeli i < DICT_CAP {
+        memory.store64(keys + i * 8, memory.as_ptr(""));
+        memory.store64(vals + i * 8, memory.as_ptr(""));
+        i = i + 1;
+    }
+    memory.store64(d,      keys);
+    memory.store64(d + 8,  vals);
+    memory.store64(d + 16, 0);
+    chu d;
+}
+
+kar dict_count(d: adad) -> adad {
+    chu memory.load64(d + 16);
+}
+
+kar dict_keys_ptr(d: adad) -> adad {
+    chu memory.load64(d);
+}
+
+kar dict_vals_ptr(d: adad) -> adad {
+    chu memory.load64(d + 8);
+}
+
+kar dict_set(d: adad, key: lafz, val: lafz) -> adad {
+    ath keys = dict_keys_ptr(d);
+    ath vals = dict_vals_ptr(d);
+    ath cnt  = dict_count(d);
+    # update existing
+    ath mut i = 0;
+    yeli i < cnt {
+        ath k = memory.load64(keys + i * 8);
+        agar lafz.eq(k, key) {
+            memory.store64(vals + i * 8, memory.as_ptr(val));
+            chu 0;
+        }
+        i = i + 1;
+    }
+    # insert new
+    agar cnt < DICT_CAP {
+        memory.store64(keys + cnt * 8, memory.as_ptr(key));
+        memory.store64(vals + cnt * 8, memory.as_ptr(val));
+        memory.store64(d + 16, cnt + 1);
+    }
+    chu 0;
+}
+
+kar dict_get(d: adad, key: lafz) -> lafz {
+    ath keys = dict_keys_ptr(d);
+    ath vals = dict_vals_ptr(d);
+    ath cnt  = dict_count(d);
+    ath mut i = 0;
+    yeli i < cnt {
+        ath k = memory.load64(keys + i * 8);
+        agar lafz.eq(k, key) {
+            chu memory.load64(vals + i * 8);
+        }
+        i = i + 1;
+    }
+    chu "";
+}
+
+kar dict_has(d: adad, key: lafz) -> adad {
+    ath keys = dict_keys_ptr(d);
+    ath cnt  = dict_count(d);
+    ath mut i = 0;
+    yeli i < cnt {
+        ath k = memory.load64(keys + i * 8);
+        agar lafz.eq(k, key) { chu 1; }
+        i = i + 1;
+    }
+    chu 0;
+}
+
+kar dict_del(d: adad, key: lafz) -> adad {
+    ath keys = dict_keys_ptr(d);
+    ath vals = dict_vals_ptr(d);
+    ath cnt  = dict_count(d);
+    ath mut i = 0;
+    yeli i < cnt {
+        ath k = memory.load64(keys + i * 8);
+        agar lafz.eq(k, key) {
+            ath mut j = i;
+            yeli j < cnt - 1 {
+                memory.store64(keys + j * 8, memory.load64(keys + (j + 1) * 8));
+                memory.store64(vals + j * 8, memory.load64(vals + (j + 1) * 8));
+                j = j + 1;
+            }
+            memory.store64(d + 16, cnt - 1);
+            chu 0;
+        }
+        i = i + 1;
+    }
+    chu 0;
+}
+
+kar dict_print(d: adad) -> adad {
+    ath keys = dict_keys_ptr(d);
+    ath vals = dict_vals_ptr(d);
+    ath cnt  = dict_count(d);
+    io.chhaap("Dict(%d) {\n", cnt);
+    ath mut i = 0;
+    yeli i < cnt {
+        io.chhaap("  \"%s\": \"%s\"\n",
+            memory.load64(keys + i * 8),
+            memory.load64(vals + i * 8));
+        i = i + 1;
+    }
+    io.chhaap("}\n");
+    chu 0;
+}
+
+# =========================================
+# SERIALIZE: Dict -> JSON string
+# =========================================
+
+kar json_write_char(buf: [harf], &pos: adad, c: adad) -> adad {
+    buf[pos] = c;
+    pos = pos + 1;
+    chu 0;
+}
+
+kar json_write_str_escaped(buf: [harf], &pos: adad, s: lafz) -> adad {
+    ath mut i = 0;
+    ath mut going = 1;
+    yeli going {
+        ath c = lafz.char_at(s, i);
+        agar c == 0 { going = 0; }
+        agar going {
+            agar c == 92 {
+                buf[pos] = 92; pos = pos + 1;
+                buf[pos] = 92; pos = pos + 1;
+            }
+            agar c != 92 wa c == 34 {
+                buf[pos] = 92; pos = pos + 1;
+                buf[pos] = 34; pos = pos + 1;
+            }
+            agar c != 92 wa c != 34 {
+                buf[pos] = c;
+                pos = pos + 1;
+            }
+            i = i + 1;
+        }
+    }
+    chu 0;
+}
+
+kar dict_to_json(d: adad, buf: [harf]) -> adad {
+    ath keys = dict_keys_ptr(d);
+    ath vals = dict_vals_ptr(d);
+    ath cnt  = dict_count(d);
+    ath mut pos = 0;
+    buf[pos] = 123; pos = pos + 1;
+    ath mut i = 0;
+    yeli i < cnt {
+        buf[pos] = 34; pos = pos + 1;
+        json_write_str_escaped(buf, &pos, memory.load64(keys + i * 8));
+        buf[pos] = 34; pos = pos + 1;
+        buf[pos] = 58; pos = pos + 1;
+        buf[pos] = 34; pos = pos + 1;
+        json_write_str_escaped(buf, &pos, memory.load64(vals + i * 8));
+        buf[pos] = 34; pos = pos + 1;
+        agar i < cnt - 1 {
+            buf[pos] = 44; pos = pos + 1;
+        }
+        i = i + 1;
+    }
+    buf[pos] = 125; pos = pos + 1;
+    buf[pos] = 0;
+    chu 0;
+}
+
+# =========================================
+# DESERIALIZE: JSON string -> Dict (adad)
+# =========================================
+
+kar is_space(ch: adad) -> adad {
+    agar ch == 32 { chu 1; }
+    agar ch == 9  { chu 1; }
+    agar ch == 10 { chu 1; }
+    agar ch == 13 { chu 1; }
+    chu 0;
+}
+
+kar skip_ws(src: lafz, &pos: adad) -> adad {
+    ath mut going = 1;
+    yeli going {
+        ath c = lafz.char_at(src, pos);
+        agar c == 0 { going = 0; }
+        agar going wa is_space(c) { pos = pos + 1; }
+        agar going wa !is_space(c) { going = 0; }
+    }
+    chu 0;
+}
+
+kar json_read_str(src: lafz, &pos: adad, buf: [harf], bmax: adad) -> adad {
+    ath mut i = 0;
+    agar lafz.char_at(src, pos) == 34 {
+        pos = pos + 1;
+        ath mut going = 1;
+        yeli going {
+            ath c = lafz.char_at(src, pos);
+            agar c == 0  { going = 0; }
+            agar c == 34 { going = 0; }
+            agar going {
+                agar c == 92 {
+                    pos = pos + 1;
+                    ath c2 = lafz.char_at(src, pos);
+                    agar c2 == 110 { buf[i] = 10; }
+                    agar c2 == 116 { buf[i] = 9;  }
+                    agar c2 == 114 { buf[i] = 13; }
+                    agar c2 != 110 wa c2 != 116 wa c2 != 114 { buf[i] = c2; }
+                }
+                agar c != 92 wa i < bmax - 1 { buf[i] = c; }
+                i = i + 1;
+                pos = pos + 1;
+            }
+        }
+        buf[i] = 0;
+        agar lafz.char_at(src, pos) == 34 { pos = pos + 1; }
+    } nate {
+        /* unquoted: number, bool, null -- skip arrays/objects */
+        agar lafz.char_at(src, pos) == 91 {
+            /* array value: skip until matching ] */
+            ath mut depth = 1;
+            pos = pos + 1;
+            ath mut going2 = 1;
+            yeli going2 {
+                ath ac = lafz.char_at(src, pos);
+                agar ac == 0  { going2 = 0; }
+                agar ac == 91 { depth = depth + 1; pos = pos + 1; }
+                agar ac == 93 {
+                    depth = depth - 1;
+                    pos = pos + 1;
+                    agar depth == 0 { going2 = 0; }
+                }
+                agar ac != 0 wa ac != 91 wa ac != 93 { pos = pos + 1; }
+            }
+            buf[0] = 0;
+        } nate {
+            agar lafz.char_at(src, pos) == 123 {
+                /* nested object: skip until matching } */
+                ath mut depth2 = 1;
+                pos = pos + 1;
+                ath mut going3 = 1;
+                yeli going3 {
+                    ath oc = lafz.char_at(src, pos);
+                    agar oc == 0   { going3 = 0; }
+                    agar oc == 123 { depth2 = depth2 + 1; pos = pos + 1; }
+                    agar oc == 125 {
+                        depth2 = depth2 - 1;
+                        pos = pos + 1;
+                        agar depth2 == 0 { going3 = 0; }
+                    }
+                    agar oc != 0 wa oc != 123 wa oc != 125 { pos = pos + 1; }
+                }
+                buf[0] = 0;
+            } nate {
+                /* plain scalar: read until , } whitespace or end */
+                ath mut going4 = 1;
+                yeli going4 {
+                    ath uv = lafz.char_at(src, pos);
+                    agar uv == 0   { going4 = 0; }
+                    agar uv == 44  { going4 = 0; }
+                    agar uv == 125 { going4 = 0; }
+                    agar is_space(uv) { going4 = 0; }
+                    agar going4 wa i < bmax - 1 {
+                        buf[i] = uv;
+                        i = i + 1;
+                        pos = pos + 1;
+                    }
+                }
+                buf[i] = 0;
+            }
+        }
+    }
+    chu i;
+}
+
+kar dict_from_json(src: lafz) -> adad {
+    ath d   = dict_new();
+    ath mut pos = 0;
+
+    skip_ws(src, &pos);
+    agar lafz.char_at(src, pos) != 123 { chu d; }
+    pos = pos + 1;
+
+    ath mut kbuf: [harf] = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0];
+    ath mut vbuf: [harf] = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0];
+
+    ath mut going = 1;
+    yeli going {
+        skip_ws(src, &pos);
+        ath c = lafz.char_at(src, pos);
+        agar c == 125 { going = 0; }
+        agar c == 0   { going = 0; }
+        agar going {
+            json_read_str(src, &pos, kbuf, 64);
+            skip_ws(src, &pos);
+            agar lafz.char_at(src, pos) == 58 { pos = pos + 1; }
+            skip_ws(src, &pos);
+            json_read_str(src, &pos, vbuf, 128);
+            ath key = lafz.concat("", kbuf);
+            ath val = lafz.concat("", vbuf);
+            dict_set(d, key, val);
+            skip_ws(src, &pos);
+            agar lafz.char_at(src, pos) == 44 { pos = pos + 1; }
+        }
+    }
+    chu d;
+}

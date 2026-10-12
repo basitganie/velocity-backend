@@ -297,10 +297,53 @@ static Token read_string(Lexer *lx) {
            i < MAX_TOKEN_LEN - 1) {
         if (lx->current_char == '\\') {
             lexer_advance(lx);
+            /*
+             * Keep C-style escapes useful for terminal output.  In
+             * particular, "\033" is ESC, not a NUL followed by "33".
+             * The old lexer treated every \0-prefixed escape as the single
+             * NUL escape, so ANSI color strings were truncated by strlen().
+             */
+            if (lx->current_char >= '0' && lx->current_char <= '7') {
+                int value = 0;
+                int digits = 0;
+                while (digits < 3 &&
+                       lx->current_char >= '0' && lx->current_char <= '7') {
+                    value = value * 8 + (lx->current_char - '0');
+                    digits++;
+                    lexer_advance(lx);
+                }
+                tok.value[i++] = (char)value;
+                continue;
+            }
+            if (lx->current_char == 'x' || lx->current_char == 'X') {
+                int value = 0;
+                int digits = 0;
+                lexer_advance(lx);
+                while (digits < 2 && isxdigit((unsigned char)lx->current_char)) {
+                    value *= 16;
+                    if (lx->current_char >= '0' && lx->current_char <= '9')
+                        value += lx->current_char - '0';
+                    else if (lx->current_char >= 'a' && lx->current_char <= 'f')
+                        value += lx->current_char - 'a' + 10;
+                    else
+                        value += lx->current_char - 'A' + 10;
+                    digits++;
+                    lexer_advance(lx);
+                }
+                if (digits == 0)
+                    tok.value[i++] = 'x';
+                else
+                    tok.value[i++] = (char)value;
+                continue;
+            }
             switch (lx->current_char) {
+                case 'e':  tok.value[i++] = '\033'; break;
                 case 'n':  tok.value[i++] = '\n'; break;
                 case 't':  tok.value[i++] = '\t'; break;
                 case 'r':  tok.value[i++] = '\r'; break;
+                case 'b':  tok.value[i++] = '\b'; break;
+                case 'f':  tok.value[i++] = '\f'; break;
+                case 'v':  tok.value[i++] = '\v'; break;
                 case '\\': tok.value[i++] = '\\'; break;
                 case '"':  tok.value[i++] = '"';  break;
                 case '0':  tok.value[i++] = '\0'; break;

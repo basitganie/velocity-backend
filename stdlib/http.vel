@@ -1,0 +1,263 @@
+# ================================================================
+# Velocity stdlib — http module  (pure Velocity)
+# HTTP/1.1 server + client
+# Requires: anaw net; anaw memory; in the importing program.
+# ================================================================
+
+saabit REQ_SIZE    = 40;
+saabit REQ_METHOD  = 0;
+saabit REQ_PATH    = 8;
+saabit REQ_BODY    = 16;
+saabit REQ_BODYLEN = 24;
+saabit REQ_FD      = 32;
+
+kar server(port: adad) -> adad {
+    chu net__tcp_server("0.0.0.0", port, 128);
+}
+
+kar next(srv: adad) -> adad {
+    ath client: adad = net__accept(srv);
+    agar client == 0 - 1 { chu 0; }
+
+    ath buf: adad = _vel_mem__malloc(8193);
+    agar buf == 0 { net__close(client); chu 0; }
+
+    ath n: adad = net__recv(client, buf, 8192, 0);
+    agar n <= 0 {
+        _vel_mem__free(buf);
+        net__close(client);
+        chu 0;
+    }
+    _vel_mem__store8(buf + n, 0);
+
+    ath req: adad = _vel_mem__calloc(1, REQ_SIZE);
+    agar req == 0 {
+        _vel_mem__free(buf);
+        net__close(client);
+        chu 0;
+    }
+    _vel_mem__store64(req + REQ_FD, client);
+
+    ath mut cur: adad = buf;
+    ath mut m: adad = 0;
+    ath b0: adad = _vel_mem__load8(cur);
+    ath b1: adad = _vel_mem__load8(cur + 1);
+
+    agar b0 == 71 { m = _vel_mem__strdup("GET");    cur = cur + 4; }
+    agar b0 == 80 {
+        agar b1 == 79 { m = _vel_mem__strdup("POST");  cur = cur + 5; }
+        agar b1 == 85 { m = _vel_mem__strdup("PUT");   cur = cur + 4; }
+        agar b1 == 65 { m = _vel_mem__strdup("PATCH"); cur = cur + 6; }
+    }
+    agar b0 == 68 { m = _vel_mem__strdup("DELETE"); cur = cur + 7; }
+    agar b0 == 72 { m = _vel_mem__strdup("HEAD");   cur = cur + 5; }
+    agar m == 0 {
+        m = _vel_mem__strdup("UNKNOWN");
+        yeli _vel_mem__load8(cur) != 32 {
+            agar _vel_mem__load8(cur) == 0 { phutraw; }
+            cur = cur + 1;
+        }
+        cur = cur + 1;
+    }
+    _vel_mem__store64(req + REQ_METHOD, m);
+
+    # parse path: scan until space or CR
+    ath path_start: adad = cur;
+    ath mut path_len: adad = 0;
+    yeli 1 == 1 {
+        ath pc: adad = _vel_mem__load8(cur + path_len);
+        agar pc == 32 { phutraw; }
+        agar pc == 13 { phutraw; }
+        agar pc == 0  { phutraw; }
+        path_len = path_len + 1;
+    }
+
+    ath path_buf: adad = _vel_mem__malloc(path_len + 1);
+    _vel_mem__memcpy(path_buf, path_start, path_len);
+    _vel_mem__store8(path_buf + path_len, 0);
+    _vel_mem__store64(req + REQ_PATH, path_buf);
+
+    # find \r\n\r\n to locate body
+    ath mut scan: adad = buf;
+    ath mut body_start: adad = 0;
+    yeli body_start == 0 {
+        ath sc: adad = _vel_mem__load8(scan);
+        agar sc == 0 { body_start = 1; phutraw; }
+        agar sc == 13 {
+            agar _vel_mem__load8(scan+1) == 10 {
+                agar _vel_mem__load8(scan+2) == 13 {
+                    agar _vel_mem__load8(scan+3) == 10 {
+                        body_start = scan + 4;
+                        phutraw;
+                    }
+                }
+            }
+        }
+        scan = scan + 1;
+    }
+
+    agar body_start > 1 {
+        ath blen: adad = n - (body_start - buf);
+        agar blen > 0 {
+            ath bbuf: adad = _vel_mem__malloc(blen + 1);
+            _vel_mem__memcpy(bbuf, body_start, blen);
+            _vel_mem__store8(bbuf + blen, 0);
+            _vel_mem__store64(req + REQ_BODY,    bbuf);
+            _vel_mem__store64(req + REQ_BODYLEN, blen);
+        }
+    }
+
+    _vel_mem__free(buf);
+    chu req;
+}
+
+kar done(req: adad) -> khali {
+    agar req == 0 { chu 0; }
+    ath mp: adad = _vel_mem__load64(req + REQ_METHOD);
+    agar mp != 0 { _vel_mem__free(mp); }
+    ath pp: adad = _vel_mem__load64(req + REQ_PATH);
+    agar pp != 0 { _vel_mem__free(pp); }
+    ath bp: adad = _vel_mem__load64(req + REQ_BODY);
+    agar bp != 0 { _vel_mem__free(bp); }
+    _vel_mem__free(req);
+}
+
+kar method(req: adad) -> lafz { chu _vel_mem__load64(req + REQ_METHOD); }
+kar path(req: adad)   -> lafz { chu _vel_mem__load64(req + REQ_PATH); }
+kar body(req: adad)   -> adad { chu _vel_mem__load64(req + REQ_BODY); }
+kar body_len(req: adad) -> adad { chu _vel_mem__load64(req + REQ_BODYLEN); }
+kar fd(req: adad)     -> adad { chu _vel_mem__load64(req + REQ_FD); }
+
+kar _send_str(client: adad, s: lafz) -> khali {
+    net__send(client, s, _vel_mem__strlen(s), 0);
+}
+
+kar _send_int(client: adad, n: adad) -> khali {
+    ath buf: adad = _vel_mem__malloc(24);
+    ath mut pos: adad = 23;
+    _vel_mem__store8(buf + pos, 0);
+    ath mut tmp: adad = n;
+    agar tmp == 0 { pos = pos - 1; _vel_mem__store8(buf + pos, 48); }
+    yeli tmp > 0 {
+        ath digit: adad = tmp - ((tmp / 10) * 10);
+        pos = pos - 1;
+        _vel_mem__store8(buf + pos, digit + 48);
+        tmp = tmp / 10;
+    }
+    net__send(client, buf + pos, 23 - pos, 0);
+    _vel_mem__free(buf);
+}
+
+kar respond(client: adad, status: adad, ctype: lafz, body_ptr: adad, blen: adad) -> khali {
+    agar status == 200 { _send_str(client, "HTTP/1.1 200 OK\r\n"); }
+    agar status == 201 { _send_str(client, "HTTP/1.1 201 Created\r\n"); }
+    agar status == 204 { _send_str(client, "HTTP/1.1 204 No Content\r\n"); }
+    agar status == 301 { _send_str(client, "HTTP/1.1 301 Moved Permanently\r\n"); }
+    agar status == 302 { _send_str(client, "HTTP/1.1 302 Found\r\n"); }
+    agar status == 400 { _send_str(client, "HTTP/1.1 400 Bad Request\r\n"); }
+    agar status == 401 { _send_str(client, "HTTP/1.1 401 Unauthorized\r\n"); }
+    agar status == 403 { _send_str(client, "HTTP/1.1 403 Forbidden\r\n"); }
+    agar status == 404 { _send_str(client, "HTTP/1.1 404 Not Found\r\n"); }
+    agar status == 500 { _send_str(client, "HTTP/1.1 500 Internal Server Error\r\n"); }
+    _send_str(client, "Server: Velocity/1.0\r\n");
+    _send_str(client, "Connection: close\r\n");
+    agar ctype != 0 {
+        _send_str(client, "Content-Type: ");
+        _send_str(client, ctype);
+        _send_str(client, "\r\n");
+    }
+    _send_str(client, "Content-Length: ");
+    _send_int(client, blen);
+    _send_str(client, "\r\n\r\n");
+    agar blen > 0 {
+        agar body_ptr != 0 { net__send(client, body_ptr, blen, 0); }
+    }
+    net__close(client);
+}
+
+kar ok_html(client: adad, html: lafz) -> khali {
+    respond(client, 200, "text/html; charset=utf-8", html, _vel_mem__strlen(html));
+}
+kar ok_json(client: adad, json: lafz) -> khali {
+    respond(client, 200, "application/json", json, _vel_mem__strlen(json));
+}
+kar ok_text(client: adad, text: lafz) -> khali {
+    respond(client, 200, "text/plain; charset=utf-8", text, _vel_mem__strlen(text));
+}
+kar not_found(client: adad) -> khali {
+    ath b: lafz = "<html><body><h1>404 Not Found</h1></body></html>";
+    respond(client, 404, "text/html; charset=utf-8", b, _vel_mem__strlen(b));
+}
+kar bad_request(client: adad) -> khali {
+    ath b: lafz = "<html><body><h1>400 Bad Request</h1></body></html>";
+    respond(client, 400, "text/html; charset=utf-8", b, _vel_mem__strlen(b));
+}
+
+kar get(host: lafz, port: adad, path_str: lafz, out_buf: adad, buf_len: adad) -> adad {
+    ath fd_c: adad = net__tcp_connect(host, port);
+    agar fd_c == 0 - 1 { chu 0 - 1; }
+    ath req: adad = _vel_mem__malloc(4096);
+    ath mut pos: adad = 0;
+    _vel_mem__memcpy(req + pos, "GET ", 4); pos = pos + 4;
+    ath pl: adad = _vel_mem__strlen(path_str);
+    _vel_mem__memcpy(req + pos, path_str, pl); pos = pos + pl;
+    ath s2: lafz = " HTTP/1.1\r\nHost: ";
+    ath s2l: adad = _vel_mem__strlen(s2);
+    _vel_mem__memcpy(req + pos, s2, s2l); pos = pos + s2l;
+    ath hl: adad = _vel_mem__strlen(host);
+    _vel_mem__memcpy(req + pos, host, hl); pos = pos + hl;
+    ath s3: lafz = "\r\nConnection: close\r\n\r\n";
+    ath s3l: adad = _vel_mem__strlen(s3);
+    _vel_mem__memcpy(req + pos, s3, s3l); pos = pos + s3l;
+    net__send(fd_c, req, pos, 0);
+    _vel_mem__free(req);
+    ath n: adad = net__recv(fd_c, out_buf, buf_len, 0);
+    net__close(fd_c);
+    chu n;
+}
+
+kar post(host: lafz, port: adad, path_str: lafz, ctype: lafz, body_ptr: adad, blen: adad, out_buf: adad, buf_len: adad) -> adad {
+    ath fd_c: adad = net__tcp_connect(host, port);
+    agar fd_c == 0 - 1 { chu 0 - 1; }
+    ath req: adad = _vel_mem__malloc(4096);
+    ath mut pos: adad = 0;
+    _vel_mem__memcpy(req + pos, "POST ", 5); pos = pos + 5;
+    ath pl: adad = _vel_mem__strlen(path_str);
+    _vel_mem__memcpy(req + pos, path_str, pl); pos = pos + pl;
+    ath s2: lafz = " HTTP/1.1\r\nHost: ";
+    ath s2l: adad = _vel_mem__strlen(s2);
+    _vel_mem__memcpy(req + pos, s2, s2l); pos = pos + s2l;
+    ath hl: adad = _vel_mem__strlen(host);
+    _vel_mem__memcpy(req + pos, host, hl); pos = pos + hl;
+    ath s3: lafz = "\r\nContent-Type: ";
+    ath s3l: adad = _vel_mem__strlen(s3);
+    _vel_mem__memcpy(req + pos, s3, s3l); pos = pos + s3l;
+    ath cl: adad = _vel_mem__strlen(ctype);
+    _vel_mem__memcpy(req + pos, ctype, cl); pos = pos + cl;
+    ath s4: lafz = "\r\nContent-Length: ";
+    ath s4l: adad = _vel_mem__strlen(s4);
+    _vel_mem__memcpy(req + pos, s4, s4l); pos = pos + s4l;
+    ath nbuf: adad = _vel_mem__malloc(24);
+    ath mut npos: adad = 23;
+    _vel_mem__store8(nbuf + npos, 0);
+    ath mut ntmp: adad = blen;
+    agar ntmp == 0 { npos = npos - 1; _vel_mem__store8(nbuf + npos, 48); }
+    yeli ntmp > 0 {
+        ath d: adad = ntmp - ((ntmp / 10) * 10);
+        npos = npos - 1;
+        _vel_mem__store8(nbuf + npos, d + 48);
+        ntmp = ntmp / 10;
+    }
+    ath nlen: adad = 23 - npos;
+    _vel_mem__memcpy(req + pos, nbuf + npos, nlen); pos = pos + nlen;
+    _vel_mem__free(nbuf);
+    ath s5: lafz = "\r\nConnection: close\r\n\r\n";
+    ath s5l: adad = _vel_mem__strlen(s5);
+    _vel_mem__memcpy(req + pos, s5, s5l); pos = pos + s5l;
+    net__send(fd_c, req, pos, 0);
+    _vel_mem__free(req);
+    agar blen > 0 { net__send(fd_c, body_ptr, blen, 0); }
+    ath n: adad = net__recv(fd_c, out_buf, buf_len, 0);
+    net__close(fd_c);
+    chu n;
+}

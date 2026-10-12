@@ -1,0 +1,112 @@
+/* ============================================================
+   vel -- Velocity XML Module v1.0
+   Wraps asm. Assemble with:
+     Linux:   nasm -f elf64 asm -o o
+     Windows: nasm -f win64 asm -o obj
+     AArch64: nasm -f elf64 -D AARCH64_TARGET asm -o o
+
+   DOM API:
+     parse(src)          -> adad   XmlNode ptr or 0 on error
+     free(node)          -> adad   free entire tree
+     tag(node)           -> lafz   element tag name
+     text(node)          -> lafz   text content of node
+     attr(node, name)    -> lafz   attribute value or ""
+     child(node, i)      -> adad   i-th child node or 0
+     child_count(node)   -> adad   number of children
+     find(node, tag)     -> adad   first direct child by tag or 0
+     find_all(node, tag) -> adad   ptr to [adad] array of matches
+     attr_count(node)    -> adad   number of attributes
+     attr_name(node, i)  -> lafz   i-th attribute name
+     attr_val(node, i)   -> lafz   i-th attribute value
+     is_element(node)    -> adad   1 if element node
+     is_text(node)       -> adad   1 if text node
+     stringify(node)     -> lafz   serialize node back to XML
+
+   SAX API:
+     sax_parse(src, handler, userdata) -> adad   0 on ok
+
+     handler is a raw adad ptr to 3 consecutive function pointers:
+       [+0]  on_open(tag, attrs, userdata)  -> adad
+       [+8]  on_close(tag, userdata)        -> adad
+       [+16] on_text(text, userdata)        -> adad
+
+     attrs passed to on_open: raw ptr.
+     count at [attrs-8], name at [attrs+i*16], value at [attrs+i*16+8]
+
+   XmlNode layout (read-only, for reference):
+     [+0]  type:        adad  (1 = element, 2 = text)
+     [+8]  tag:         lafz
+     [+16] text:        lafz
+     [+24] attrs ptr:   adad
+     [+32] attr_count:  adad
+     [+40] children ptr: adad
+     [+48] child_count: adad
+     [+56] child_cap:   adad
+   ============================================================ */
+
+anaw xml;
+
+kar parse(src: lafz) -> adad {
+    chu _parse(src);
+}
+
+kar free(node: adad) -> adad {
+    chu _free(node);
+}
+
+kar tag(node: adad) -> lafz {
+    chu _tag(node);
+}
+
+kar text(node: adad) -> lafz {
+    chu _text(node);
+}
+
+kar attr(node: adad, name: lafz) -> lafz {
+    chu _attr(node, name);
+}
+
+kar child(node: adad, i: adad) -> adad {
+    chu _child(node, i);
+}
+
+kar child_count(node: adad) -> adad {
+    chu _child_count(node);
+}
+
+kar find(node: adad, tag: lafz) -> adad {
+    chu _find(node, tag);
+}
+
+kar find_all(node: adad, tag: lafz) -> adad {
+    chu _find_all(node, tag);
+}
+
+kar attr_count(node: adad) -> adad {
+    chu _attr_count(node);
+}
+
+kar attr_name(node: adad, i: adad) -> lafz {
+    chu _attr_name(node, i);
+}
+
+kar attr_val(node: adad, i: adad) -> lafz {
+    chu _attr_val(node, i);
+}
+
+kar is_element(node: adad) -> adad {
+    chu _is_element(node);
+}
+
+kar is_text(node: adad) -> adad {
+    chu _is_text(node);
+}
+
+kar stringify(node: adad) -> lafz {
+    chu _stringify(node);
+}
+
+kar sax_parse(src: lafz, handler: adad, userdata: adad) -> adad {
+    chu _sax_parse(src, handler, userdata);
+}
+

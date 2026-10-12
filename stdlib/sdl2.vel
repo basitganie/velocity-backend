@@ -36,10 +36,10 @@ saabit SDL_MOUSEWHEEL    = 1027;
 saabit SDLK_ESCAPE  = 27;
 saabit SDLK_RETURN  = 13;
 saabit SDLK_SPACE   = 32;
-saabit SDLK_UP      = 1073741906;
-saabit SDLK_DOWN    = 1073741905;
-saabit SDLK_LEFT    = 1073741904;
-saabit SDLK_RIGHT   = 1073741903;
+saabit SDLK_UP      = 26; #1073741906;
+saabit SDLK_DOWN    = 22; #1073741905;
+saabit SDLK_LEFT    =  4; #1073741904;
+saabit SDLK_RIGHT   =  7; #1073741903;
 
 # keys
 saabit SDLK_0 = 48;
@@ -372,16 +372,12 @@ kar ttf_text_texture(ren: adad, font: adad, text: lafz, r: adad, g: adad, b: ada
 # ttf_draw_text(ren, font, text, x, y, r, g, b) -> khali
 # render text string at pixel position x,y
 kar ttf_draw_text(ren: adad, font: adad, text: lafz, x: adad, y: adad, r: adad, g: adad, b: adad) -> khali {
-    ath surf = ttf_render_blended(font, text, r, g, b);
-    agar surf == 0 { chu; }
-    ath tex = create_texture(ren, surf);
-    ath mut tw = 0;
-    ath mut th = 0;
-    sdl2__query_texture(tex, 0, 0, &tw, &th);
-    free_surface(surf);
-    ath dst = make_rect(x, y, tw, th);
-    sdl2__render_copy(ren, tex, 0, dst);
-    destroy_texture(tex);
+    ath color = sdl2__make_color(r, g, b, 255);
+    sdl2__ttf_draw_text(ren, font, text, x, y, color);
+}
+
+kar ttf_draw_text6(ren: adad, font: adad, text: lafz, x: adad, y: adad, color: adad) -> khali {
+    sdl2__ttf_draw_text(ren, font, text, x, y, color);
 }
 
 # ttf_text_width(font, text) -> adad

@@ -1,0 +1,98 @@
+anaw io;
+anaw lafz;
+anaw system;
+
+bina Manifest {
+    package_name:    [harf];
+    package_version: [harf];
+    package_edition: [harf];
+    build_output:    [harf];
+}
+
+bina TomlParser {
+    src:     lafz;
+    pos:     adad;
+    len:     adad;
+    section: adad;
+}
+
+saabit SEC_NONE    = 0;
+saabit SEC_PACKAGE = 1;
+saabit SEC_BUILD   = 2;
+
+kar is_space(ch: adad) -> adad {
+    agar ch == 32 { chu poz; }
+    agar ch == 9  { chu poz; }
+    agar ch == 13 { chu poz; }
+    chu apuz;
+}
+
+kar is_ident_char(ch: adad) -> adad {
+    agar ch >= 97  wa ch <= 122 { chu poz; }
+    agar ch >= 65  wa ch <= 90  { chu poz; }
+    agar ch >= 48  wa ch <= 57  { chu poz; }
+    agar ch == 95  { chu poz; }
+    agar ch == 45  { chu poz; }
+    chu apuz;
+}
+
+kar p_eof(&p: TomlParser) -> adad {
+    chu p.pos >= p.len;
+}
+
+kar p_ch(&p: TomlParser) -> adad {
+    agar p_eof(&p) { chu 0; }
+    chu lafz.char_at(p.src, p.pos);
+}
+
+kar p_adv(&p: TomlParser) -> khali {
+    p.pos = p.pos + 1;
+}
+kar tp_skip_space(&p: TomlParser) -> khali {
+    yeli !p_eof(&p) wa is_space(p_ch(&p)) {
+        p_adv(&p);
+    }
+}
+
+kar tp_skip_line(&p: TomlParser) -> khali {
+    yeli !p_eof(&p) wa p_ch(&p) != 10 {
+        p_adv(&p);
+    }
+}
+
+kar match_word(src: lafz, pos: adad, word: lafz, wlen: adad) -> adad {
+    ath mut i = 0;
+    yeli i < wlen {
+        ath sc = lafz.char_at(src, pos + i);
+        ath wc = lafz.char_at(word, i);
+        agar sc != wc { chu apuz; }
+        i = i + 1;
+    }
+    ath next = lafz.char_at(src, pos + wlen);
+    agar is_ident_char(next) { chu apuz; }
+    chu poz;
+}
+
+kar read_into_buf(
+    &p:   TomlParser,
+    buf:  [harf],
+    bmax: adad
+) -> khali {
+    agar p_ch(&p) != 34 { chu; }
+    p_adv(&p);
+    ath mut i = 0;
+    ath mut going = poz;
+    yeli going {
+        ath c = lafz.char_at(p.src, p.pos);
+        agar c == 34 { going = apuz; }
+        agar c == 0  { going = apuz; }
+        agar going wa i < bmax - 1 {
+            buf[i] = c;
+            i = i + 1;
+            p.pos = p.pos + 1;
+        }
+        agar going wa i >= bmax - 1 { going = apuz; }
+    }
+    buf[i] = 0;
+    agar !p_eof(&p) { p_adv(&p); }
+}

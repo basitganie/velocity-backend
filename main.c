@@ -3,6 +3,7 @@
  */
 
 #include "velocity.h"
+#include <locale.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -156,7 +157,14 @@ static void compile(CompilerOptions *opts) {
             if (pre_toks[pi+1].type != TOK_IDENTIFIER) continue;
             module_manager_load_module(&mgr, pre_toks[pi+1].value, src);
         }
-        /* Second pass: preload saabit constants from each .vel module */
+        /* Second pass: preload saabit constants from each .vel module,
+         * recursing into transitive imports so e.g. main -> parser -> lexer
+         * constants all become visible before the main parse. */
+        char visited[MAX_IMPORTS][MAX_PATH_LEN];
+        int visited_count = 0;
+        char worklist[MAX_IMPORTS][MAX_PATH_LEN];
+        int wl_count = 0;
+
         for (int pi = 0; pi < pre_ntok - 1; pi++) {
             if (pre_toks[pi].type != TOK_ANAW) continue;
             if (pre_toks[pi+1].type != TOK_IDENTIFIER) continue;
@@ -164,9 +172,49 @@ static void compile(CompilerOptions *opts) {
             char *mod_path = module_manager_find_module(&mgr, mod);
             if (!mod_path) continue;
             const char *ext = strrchr(mod_path, '.');
-            if (ext && strcmp(ext, ".vel") == 0)
-                parser_preload_module_consts(mod_path);
+            if (ext && strcmp(ext, ".vel") == 0 &&
+                strcmp(mod_path, src) != 0 &&
+                wl_count < MAX_IMPORTS)
+                vl_strncpy(worklist[wl_count++], mod_path, MAX_PATH_LEN);
             free(mod_path);
+        }
+
+        while (wl_count > 0) {
+            char cur[MAX_PATH_LEN];
+            vl_strncpy(cur, worklist[--wl_count], MAX_PATH_LEN);
+
+            bool already = false;
+            for (int vi = 0; vi < visited_count; vi++) {
+                if (strcmp(visited[vi], cur) == 0) { already = true; break; }
+            }
+            if (already) continue;
+            if (visited_count < MAX_IMPORTS)
+                vl_strncpy(visited[visited_count++], cur, MAX_PATH_LEN);
+
+            parser_preload_module_consts(cur);
+
+            /* scan cur for its own anaw imports and enqueue them */
+            char *sub_src = read_file(cur);
+            if (!sub_src) continue;
+            Lexer sub_lex; lexer_init(&sub_lex, sub_src);
+            Token *sub_toks = (Token*)malloc(sizeof(Token) * MAX_TOKENS);
+            if (!sub_toks) { free(sub_src); continue; }
+            int sub_ntok = lexer_tokenize(&sub_lex, sub_toks, MAX_TOKENS);
+            for (int si = 0; si < sub_ntok - 1; si++) {
+                if (sub_toks[si].type != TOK_ANAW) continue;
+                if (sub_toks[si+1].type != TOK_IDENTIFIER) continue;
+                module_manager_load_module(&mgr, sub_toks[si+1].value, cur);
+                char *sub_path = module_manager_find_module(&mgr, sub_toks[si+1].value);
+                if (!sub_path) continue;
+                const char *sub_ext = strrchr(sub_path, '.');
+                if (sub_ext && strcmp(sub_ext, ".vel") == 0 &&
+                    strcmp(sub_path, src) != 0 &&
+                    wl_count < MAX_IMPORTS)
+                    vl_strncpy(worklist[wl_count++], sub_path, MAX_PATH_LEN);
+                free(sub_path);
+            }
+            free(sub_toks);
+            free(sub_src);
         }
         free(pre_toks);
     }
@@ -257,19 +305,63 @@ static void compile(CompilerOptions *opts) {
         int   tmp_count = 0;
         for (int i = 0; i < mgr.import_count; i++) {
             ImportInfo *imp = &mgr.imports[i];
+            /*
+             * A module source commonly contains `anaw <itself>;` so its
+             * public constants and qualified names work while parsing. When
+             * compiling that source with --module, do not recursively invoke
+             * velc on the same module forever.
+             */
+            if (opts->module_compile_name &&
+                strcmp(opts->module_compile_name, imp->module_name) == 0)
+                continue;
             const char *asm_src = NULL;
-            /* Look for _aarch64.s sidecar first, then fall back to .asm */
+            const char *imp_ext = strrchr(imp->file_path, '.');
+            bool source_compiled = false;
+
+            /*
+             * Prefer the .vel source when it exists.  A module may also have
+             * a legacy x86 .asm file, but that file is not a valid Android
+             * implementation and can expose a different API.
+             */
+            if (imp_ext && strcmp(imp_ext, ".vel") == 0) {
+                char mod_obj[MAX_PATH_LEN];
+                char mod_base[MAX_PATH_LEN];
+                snprintf(mod_obj, MAX_PATH_LEN, "%s__%s.o", out, imp->module_name);
+                snprintf(mod_base, MAX_PATH_LEN, "%s__%s", out, imp->module_name);
+                const char *velc_cmd = access("./velc", X_OK) == 0 ? "./velc" : "velc";
+                const char *stdlib_arg = opts->stdlib_path ? opts->stdlib_path : "stdlib";
+                snprintf(cmd, sizeof(cmd),
+                         "%s \"%s\" -o \"%s\" --stdlib \"%s\""
+                         " --target aarch64-linux-android --no-link --module \"%s\"",
+                         velc_cmd, imp->file_path, mod_base, stdlib_arg,
+                         imp->module_name);
+                if (verbose) printf("[velocity] compile vel module: %s\n", imp->file_path);
+                if (run_cmd(cmd, false) == 0) {
+                    strncat(extra_objs, " \"", sizeof(extra_objs)-strlen(extra_objs)-1);
+                    strncat(extra_objs, mod_obj, sizeof(extra_objs)-strlen(extra_objs)-1);
+                    strncat(extra_objs, "\"", sizeof(extra_objs)-strlen(extra_objs)-1);
+                    tmp_objs[tmp_count++] = strdup(mod_obj);
+                }
+                source_compiled = true;
+                if (strcmp(imp->module_name, "json") == 0)
+                    continue;
+            }
+
+            /*
+             * Only an explicitly AArch64 sidecar is valid here.  The regular
+             * .asm files are NASM x86-64 sources, even when they contain
+             * conditional AArch64 text, and GNU as cannot parse NASM
+             * directives such as %ifdef or global.
+             */
             char a64_asm[MAX_PATH_LEN];
             snprintf(a64_asm, sizeof(a64_asm), "%s", imp->file_path);
             /* Replace .asm → _aarch64.s if present */
             char *dot = strrchr(a64_asm, '.');
             if (dot) strcpy(dot, "_aarch64.s");
             if (file_exists(a64_asm)) asm_src = a64_asm;
-            else if (imp->asm_path[0] && file_exists(imp->asm_path))
-                asm_src = imp->asm_path;
 
             /* If no .asm found, check if this is a .vel module — compile it with AArch64 backend */
-            if (!asm_src) {
+            if (!asm_src && !source_compiled) {
                 /* Check for .vel source */
                 char vel_src[MAX_PATH_LEN];
                 vl_strncpy(vel_src, imp->file_path, MAX_PATH_LEN);
@@ -307,7 +399,27 @@ static void compile(CompilerOptions *opts) {
                     continue;
                 }
             }
-            if (!asm_src) continue;
+            if (!asm_src) {
+                /*
+                 * A source module may still have an x86 companion.  Do not
+                 * attempt to assemble it for Android; the eventual link
+                 * diagnostic (when linking) is more accurate than an ARM
+                 * assembler syntax error.  --no-link is intentionally still
+                 * useful for checking the generated main object.
+                 */
+                if (imp->asm_path[0] && file_exists(imp->asm_path) &&
+                    !opts->no_link) {
+                    fprintf(stderr,
+                        "\n\033[1;31merror\033[0m: module '%s' has no "
+                        "AArch64 companion.\n"
+                        "  Found x86-64 source: %s\n"
+                        "  Add %s_aarch64.s next to the module or provide "
+                        "an AArch64 implementation.\n",
+                        imp->module_name, imp->asm_path, imp->module_name);
+                    exit(1);
+                }
+                continue;
+            }
 
             char sidecar_obj[MAX_PATH_LEN];
             snprintf(sidecar_obj, MAX_PATH_LEN, "%s__%s.o", out, imp->module_name);
@@ -398,7 +510,16 @@ static void compile(CompilerOptions *opts) {
     for (int i = 0; i < mgr.import_count; i++) {
         ImportInfo *imp = &mgr.imports[i];
         const char *asm_src = NULL;
-        if (imp->asm_path[0])        asm_src = imp->asm_path;
+        /*
+         * .vel modules are emitted into the main assembly by codegen_program.
+         * Do not also assemble a same-named legacy .asm sidecar: it may be a
+         * different API revision (notably json.vel/json.asm).
+         */
+        const char *imp_ext = strrchr(imp->file_path, '.');
+        if (imp_ext && strcmp(imp_ext, ".vel") == 0 &&
+            strcmp(imp->module_name, "json") == 0) {
+            asm_src = NULL;
+        } else if (imp->asm_path[0])  asm_src = imp->asm_path;
         else if (imp->is_native_asm) asm_src = imp->file_path;
         if (!asm_src) {
             if (imp->link_flags[0]) {
@@ -467,6 +588,9 @@ static void compile(CompilerOptions *opts) {
 }
 
 int main(int argc, char *argv[]) {
+    /* Force '.' decimal parsing for strtod() regardless of OS/user locale. */
+    setlocale(LC_NUMERIC, "C");
+
     module_manager_set_binary_dir(argv[0]);
 
     if (argc < 2) {

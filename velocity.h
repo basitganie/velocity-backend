@@ -49,7 +49,7 @@
 #define VL_VERSION_PATCH 0
 
 #define MAX_TOKEN_LEN    256
-#define MAX_TOKENS       16000
+#define MAX_TOKENS       32000
 #define MAX_IDENTIFIERS  1024
 #define MAX_CODE_LINES   20000
 #define MAX_IMPORTS      128
@@ -253,6 +253,8 @@ typedef struct StructDef {
     bool is_union;
     int size;
     bool sizing;
+    char generic_params[8][MAX_TOKEN_LEN];
+    int generic_count;
 } StructDef;
 
 /* ------------------------------------------------------------

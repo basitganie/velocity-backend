@@ -173,8 +173,9 @@ bool module_manager_load_module(ModuleManager *mgr,
         vl_strncpy(imp->link_flags, "-lSDL2main -lSDL2",
                 sizeof(imp->link_flags));
 #else
+        /* stdlib/sdl2.asm also wraps SDL_ttf symbols */
         vl_strncpy(imp->link_flags,
-                "-lSDL2",
+                "-lSDL2 -lSDL2_ttf",
                 sizeof(imp->link_flags));
 #endif
     } else if (strcmp(module_name, "raylib") == 0) {

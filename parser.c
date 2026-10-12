@@ -29,6 +29,50 @@ typedef struct {
 static EnumConst g_enum_consts[4096];
 static int g_enum_const_count = 0;
 
+static double parse_float_literal_portable(const char *s) {
+    const unsigned char *p = (const unsigned char*)s;
+    bool neg = false;
+    if (*p == '+' || *p == '-') {
+        neg = (*p == '-');
+        p++;
+    }
+
+    double value = 0.0;
+    while (isdigit(*p)) {
+        value = value * 10.0 + (double)(*p - '0');
+        p++;
+    }
+
+    if (*p == '.' || *p == ',') {
+        double place = 0.1;
+        p++;
+        while (isdigit(*p)) {
+            value += (double)(*p - '0') * place;
+            place *= 0.1;
+            p++;
+        }
+    }
+
+    if (*p == 'e' || *p == 'E') {
+        bool exp_neg = false;
+        int exp = 0;
+        p++;
+        if (*p == '+' || *p == '-') {
+            exp_neg = (*p == '-');
+            p++;
+        }
+        while (isdigit(*p)) {
+            exp = exp * 10 + (*p - '0');
+            p++;
+        }
+        double scale = 1.0;
+        while (exp-- > 0) scale *= 10.0;
+        value = exp_neg ? value / scale : value * scale;
+    }
+
+    return neg ? -value : value;
+}
+
 static bool enum_const_lookup(const char *name, long long *out) {
     for (int i = 0; i < g_enum_const_count; i++) {
         if (strcmp(g_enum_consts[i].name, name) == 0) {
@@ -136,6 +180,22 @@ static void parser_skip_generic_suffix(Parser *parser) {
              "unterminated generic type argument list");
 }
 
+static void parser_mark_generic_typeinfo(
+        TypeInfo *ti, char generic_params[8][MAX_TOKEN_LEN], int generic_count) {
+    if (!ti) return;
+    if (ti->kind == TYPE_STRUCT && ti->struct_name[0]) {
+        for (int i = 0; i < generic_count; i++) {
+            if (strcmp(ti->struct_name, generic_params[i]) == 0) {
+                vl_strncpy(ti->generic_name, ti->struct_name, MAX_TOKEN_LEN);
+                ti->struct_name[0] = '\0';
+                break;
+            }
+        }
+    }
+    if (ti->elem_typeinfo)
+        parser_mark_generic_typeinfo(ti->elem_typeinfo, generic_params, generic_count);
+}
+
 static ValueType parse_type(Parser *parser, TypeInfo **out_info) {
     if (out_info) *out_info = NULL;
     Token tok = parser_current(parser);
@@ -144,9 +204,13 @@ static ValueType parse_type(Parser *parser, TypeInfo **out_info) {
     if (tok.type == TOK_STAR) {
         parser_advance(parser);
         TypeInfo *inner_info = NULL;
-        parse_type(parser, &inner_info);
-        if (inner_info) free(inner_info);
-        if (out_info) *out_info = NULL;
+        ValueType inner_type = parse_type(parser, &inner_info);
+        TypeInfo *ti = (TypeInfo*)calloc(1, sizeof(TypeInfo));
+        if (!ti) error(ERR_FATAL, "Out of memory");
+        ti->kind = TYPE_PTR;
+        ti->elem_type = inner_type;
+        ti->elem_typeinfo = inner_info;
+        if (out_info) *out_info = ti;
         return TYPE_PTR;
     }
 
@@ -674,7 +738,7 @@ static ASTNode* parse_primary(Parser *p) {
     if (cur.type == TOK_FLOAT) {
         ASTNode *n = ast_node_new(AST_FLOAT);
         n->line = cur.line; n->column = cur.column;
-        n->data.float_lit.value = strtod(cur.value, NULL);
+        n->data.float_lit.value = parse_float_literal_portable(cur.value);
         n->data.float_lit.type  = TYPE_F64;
         parser_advance(p);
         return n;
@@ -1968,6 +2032,7 @@ static ASTNode* parse_struct(Parser *p, bool is_union) {
             }
         }
         if (!is_gen) ftype = parse_type(p, &ftinfo);
+        parser_mark_generic_typeinfo(ftinfo, generic_params, generic_count);
         field_names[field_count]  = strdup(fname.value);
         field_types[field_count]  = ftype;
         field_ti[field_count]     = ftinfo;
@@ -2087,6 +2152,7 @@ static ASTNode* parse_function(Parser *p) {
             }
             if (!is_generic_param)
                 ptype = parse_type(p, &ptinfo);
+            parser_mark_generic_typeinfo(ptinfo, generic_params, generic_count);
             if (is_ref) {
                 if (!ptinfo) {
                     ptinfo = (TypeInfo*)calloc(1, sizeof(TypeInfo));
@@ -2120,8 +2186,10 @@ static ASTNode* parse_function(Parser *p) {
             break;
         }
     }
-    if (!ret_is_generic)
+    if (!ret_is_generic) {
         ret_type = parse_type(p, &rtinfo);
+        parser_mark_generic_typeinfo(rtinfo, generic_params, generic_count);
+    }
     parser_expect(p, TOK_LBRACE);
     int body_c;
     ASTNode **body = parse_block(p, &body_c);
@@ -2244,7 +2312,10 @@ void parser_preload_module_consts(const char *vel_path) {
     if (!src) return;
 
     Lexer lx; lexer_init(&lx, src);
-    Token toks[MAX_TOKENS];
+    /* Avoid large stack allocations (notably on Windows, which often
+       has a much smaller default thread stack than Linux). */
+    Token *toks = (Token*)malloc(sizeof(Token) * MAX_TOKENS);
+    if (!toks) { free(src); return; }
     int ntok = lexer_tokenize(&lx, toks, MAX_TOKENS);
 
     /* Simple token scan: find TOK_SAABIT NAME = literal ; */
@@ -2287,5 +2358,6 @@ void parser_preload_module_consts(const char *vel_path) {
         }
         i = vi; /* skip ahead */
     }
+    free(toks);
     free(src);
 }

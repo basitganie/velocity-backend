@@ -1,0 +1,14 @@
+anaw lafz;
+
+bina String{
+    str: lafz
+}
+amal String{
+    kar from(str: lafz)->String{
+        ath s = String{str: str};
+        s;
+    }
+    kar length(self)->uadad{
+        chu lafz.strlen(self.str);
+    }
+}

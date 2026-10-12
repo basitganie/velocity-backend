@@ -514,3 +514,154 @@ sdl2__make_color:
     shl ecx, 24
     or eax, ecx
     ret
+
+; ============================================================
+; sdl2__ttf_text_width(font, text) -> adad
+; Returns pixel width of text rendered with font.
+; Uses TTF_SizeUTF8 internally.
+; ============================================================
+extern TTF_SizeUTF8
+
+global sdl2__ttf_text_width
+sdl2__ttf_text_width:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    sub  rsp, 16            ; space for w and h on stack
+    mov  rbx, rdi           ; font
+    mov  r12, rsi           ; text
+    ; TTF_SizeUTF8(font, text, &w, &h)
+    mov  rdi, rbx
+    mov  rsi, r12
+    lea  rdx, [rsp]         ; &w
+    lea  rcx, [rsp + 4]     ; &h
+    call TTF_SizeUTF8
+    ; return w
+    mov  eax, dword [rsp]
+    add  rsp, 16
+    pop  r12
+    pop  rbx
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; ============================================================
+; sdl2__ttf_line_skip(font) -> adad
+; Returns recommended line skip for font (TTF_FontLineSkip).
+; ============================================================
+global sdl2__ttf_line_skip
+sdl2__ttf_line_skip:
+    push rbp
+    mov  rbp, rsp
+    call TTF_FontLineSkip   ; rdi = font already
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; ============================================================
+; sdl2__ttf_draw_text(ren, font, text, x, y, r, g, b) -> khali
+; Convenience: render + create texture + copy + destroy.
+; rdi=ren, rsi=font, rdx=text, rcx=x, r8=y, r9=r, [rsp+8]=g, [rsp+16]=b
+; ============================================================
+extern TTF_RenderUTF8_Blended
+extern SDL_CreateTextureFromSurface
+extern SDL_FreeSurface
+extern SDL_QueryTexture
+extern SDL_RenderCopy
+extern SDL_DestroyTexture
+
+; sdl2__ttf_draw_text(ren, font, text, x, y, color_packed) -> khali
+; color_packed = r | (g<<8) | (b<<16) | (0xFF<<24)  — fits in 6 regs, no stack args
+; rdi=ren, rsi=font, rdx=text, rcx=x, r8=y, r9=color_packed
+global sdl2__ttf_draw_text
+sdl2__ttf_draw_text:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    ; 5 pushes above = 40 bytes. need rsp 16-aligned before calls.
+    ; entry rsp was 16-aligned (call pushed ret addr).
+    ; push rbp: rsp-8 (misaligned). push rbx,r12,r13,r14,r15: rsp-48 (aligned).
+    ; sub rsp, 32 keeps alignment (48+32=80, divisible by 16).
+    sub  rsp, 24            ; w(4)+h(4)+rect(16) = 24 bytes, keeps 16-byte alignment (56+24=80)
+
+    mov  rbx, rdi           ; renderer
+    mov  r12, rsi           ; font
+    mov  r13, rdx           ; text
+    mov  r14, rcx           ; x
+    mov  r15, r8            ; y
+    mov  r9d, r9d           ; color_packed already in r9
+
+    ; TTF_RenderUTF8_Blended(font, text, color_packed)
+    mov  rdi, r12
+    mov  rsi, r13
+    mov  edx, r9d
+    call TTF_RenderUTF8_Blended
+    test rax, rax
+    jz   .dt_fail
+    mov  r12, rax           ; surface
+
+    ; SDL_CreateTextureFromSurface(ren, surface)
+    mov  rdi, rbx
+    mov  rsi, r12
+    call SDL_CreateTextureFromSurface
+    test rax, rax
+    jz   .dt_free_surf
+    mov  r13, rax           ; texture
+
+    ; SDL_FreeSurface(surface)
+    mov  rdi, r12
+    call SDL_FreeSurface
+
+    ; SDL_QueryTexture(tex, NULL, NULL, &w, &h)
+    mov  rdi, r13
+    xor  rsi, rsi
+    xor  rdx, rdx
+    lea  rcx, [rsp]
+    lea  r8,  [rsp + 4]
+    call SDL_QueryTexture
+
+    ; build SDL_Rect at rsp+8: {x, y, w, h}
+    mov  eax, dword [rsp]
+    mov  ecx, dword [rsp + 4]
+    mov  dword [rsp + 8],  r14d
+    mov  dword [rsp + 12], r15d
+    mov  dword [rsp + 16], eax
+    mov  dword [rsp + 20], ecx
+
+    ; SDL_RenderCopy(ren, tex, NULL, &dst)
+    mov  rdi, rbx
+    mov  rsi, r13
+    xor  rdx, rdx
+    lea  rcx, [rsp + 8]
+    call SDL_RenderCopy
+
+    ; SDL_DestroyTexture(tex)
+    mov  rdi, r13
+    call SDL_DestroyTexture
+    jmp  .dt_done
+
+.dt_free_surf:
+    mov  rdi, r12
+    call SDL_FreeSurface
+.dt_fail:
+.dt_done:
+    add  rsp, 48
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+; sdl2__ttf_draw_text6 — alias for sdl2__ttf_draw_text
+; same signature: (ren, font, text, x, y, color_packed)
+global sdl2__ttf_draw_text6
+sdl2__ttf_draw_text6:
+    jmp sdl2__ttf_draw_text

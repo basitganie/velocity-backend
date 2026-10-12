@@ -1,0 +1,160 @@
+// ============================================================
+// Velocity StdLib — net module (net.vel) v0.1.0
+// Bindings for net.asm / net_aarch64.s
+//
+// Usage:
+//   anaw net;
+//
+//   net.init();
+//   ath fd = net.tcp_connect("93.184.216.34", 80);
+//   net.send(fd, "GET / HTTP/1.0\r\n\r\n", 18, 0);
+//   ath n = net.recv(fd, buf, 4096, 0);
+//   net.close(fd);
+//   net.shutdown_lib();
+// ============================================================
+
+// ---- init / shutdown ----------------------------------------
+
+// Must be called once on Windows before any net function.
+// No-op on Linux/Android.
+kar init() -> adad {
+    chu net__init();
+}
+
+// Cleanup on Windows. No-op on Linux/Android.
+kar shutdown_lib() -> khali {
+    net__shutdown_lib();
+}
+
+// ---- byte-order helpers -------------------------------------
+
+// Convert port from host byte order to network byte order.
+kar htons(port: adad) -> adad {
+    chu net__htons(port);
+}
+
+// Parse "a.b.c.d" into packed big-endian u32.
+// Returns 0 on error.
+kar inet_aton(ip: lafz) -> adad {
+    chu net__inet_aton(ip);
+}
+
+// ---- raw socket primitives ----------------------------------
+
+// Create a socket. domain=2 (AF_INET), type=1 (TCP)/2 (UDP).
+// Returns fd or -1.
+kar socket(domain: adad, _harf: adad, proto: adad) -> adad {
+    chu net__socket(domain, _harf, proto);
+}
+
+// Create a TCP socket (AF_INET, SOCK_STREAM). Returns fd or -1.
+kar make_tcp() -> adad {
+    chu net__make_tcp();
+}
+
+// Create a UDP socket (AF_INET, SOCK_DGRAM). Returns fd or -1.
+kar make_udp() -> adad {
+    chu net__make_udp();
+}
+
+// Bind fd to ip:port. Use "0.0.0.0" for all interfaces.
+// Returns 0 on success, -1 on error.
+kar bind(fd: adad, ip: lafz, port: adad) -> adad {
+    chu net__bind(fd, ip, port);
+}
+
+// Start listening on fd. backlog = max pending connections.
+// Returns 0 on success, -1 on error.
+kar listen(fd: adad, backlog: adad) -> adad {
+    chu net__listen(fd, backlog);
+}
+
+// Accept a connection on server fd.
+// Returns client fd or -1.
+kar accept(fd: adad) -> adad {
+    chu net__accept(fd);
+}
+
+// Connect fd to ip:port.
+// Returns 0 on success, -1 on error.
+kar connect(fd: adad, ip: lafz, port: adad) -> adad {
+    chu net__connect(fd, ip, port);
+}
+
+// Send len bytes from buf on fd. flags=0 for normal send.
+// Returns bytes sent or -1.
+kar send(fd: adad, buf: [harf], len: adad, flags: adad) -> adad {
+    chu net__send(fd, buf, len, flags);
+}
+
+// Receive up to len bytes into buf from fd. flags=0 for normal recv.
+// Returns bytes received, 0 if connection closed, -1 on error.
+kar recv(fd: adad, buf: [harf], len: adad, flags: adad) -> adad {
+    chu net__recv(fd, buf, len, flags);
+}
+
+// Close a socket fd.
+// Returns 0 on success, -1 on error.
+kar close(fd: adad) -> adad {
+    chu net__close(fd);
+}
+
+// Set socket option. level=1 (SOL_SOCKET), opt=SO_*, val=value.
+kar setsockopt(fd: adad, level: adad, opt: adad, val: adad) -> adad {
+    chu net__setsockopt(fd, level, opt, val);
+}
+
+// ---- socket options shortcuts -------------------------------
+
+// Set SO_REUSEADDR on fd. Call before bind() for servers.
+// Returns 0 on success, -1 on error.
+kar set_reuseaddr(fd: adad) -> adad {
+    chu net__set_reuseaddr(fd);
+}
+
+// Set O_NONBLOCK on fd (non-blocking I/O).
+// Returns 0 on success, -1 on error.
+kar set_nonblock(fd: adad) -> adad {
+    chu net__set_nonblock(fd);
+}
+
+// ---- convenience wrappers -----------------------------------
+
+// Create TCP server: socket + set_reuseaddr + bind + listen.
+// ip = "0.0.0.0" to listen on all interfaces.
+// Returns server fd or -1 on any failure.
+kar tcp_server(ip: lafz, port: adad, backlog: adad) -> adad {
+    chu net__tcp_server(ip, port, backlog);
+}
+
+// Create TCP client connection: socket + connect.
+// Returns connected fd or -1 on failure.
+kar tcp_connect(ip: lafz, port: adad) -> adad {
+    chu net__tcp_connect(ip, port);
+}
+
+// Send a UDP datagram to ip:port.
+// Returns bytes sent or -1.
+kar udp_sendto(fd: adad, buf: [harf], len: adad, ip: lafz, port: adad) -> adad {
+    chu net__udp_sendto(fd, buf, len, ip, port);
+}
+
+// Receive a UDP datagram into buf (max len bytes).
+// Sender info stored internally — retrieve with peer_ip/peer_port.
+// Returns bytes received or -1.
+kar udp_recvfrom(fd: adad, buf: [harf], len: adad) -> adad {
+    chu net__udp_recvfrom(fd, buf, len);
+}
+
+// ---- peer info ----------------------------------------------
+
+// Get IP string of remote peer for a connected/accepted socket.
+// Returns pointer to a static internal buffer — copy before reuse.
+kar peer_ip(fd: adad) -> lafz {
+    chu net__peer_ip(fd);
+}
+
+// Get port of remote peer (host byte order).
+kar peer_port(fd: adad) -> adad {
+    chu net__peer_port(fd);
+}
